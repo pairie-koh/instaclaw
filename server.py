@@ -1,0 +1,568 @@
+# Run: uvicorn server:app --host 127.0.0.1 --port 8000
+"""FastAPI backend for instaclaw — local-only IG vibe-check web app.
+
+Wraps agent_scrape / analyze / render / screenshot behind an HTTP + SSE API.
+Single-user, in-memory job queue, SQLite persistence. No auth, no CORS.
+"""
+import asyncio
+import json
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import aiosqlite
+from anthropic import Anthropic
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+
+import agent_scrape
+import analyze
+import render as render_mod
+import screenshot as screenshot_mod
+
+ROOT = Path(__file__).parent
+OUT_DIR = ROOT / "out"
+OUT_DIR.mkdir(exist_ok=True)
+STATIC_DIR = ROOT / "static"
+DB_PATH = OUT_DIR / "instaclaw.db"
+MODEL = "claude-opus-4-7"
+
+anthropic_client = Anthropic()
+
+
+# ---------- job state (in-memory) ----------
+@dataclass
+class JobState:
+    job_id: str
+    kind: str          # "self" | "target"
+    handle: str
+    status: str = "pending"   # pending|scraping|analyzing|done|error
+    created_at: str = ""
+    scrape: Optional[dict] = None
+    readout: Optional[dict] = None
+    error: Optional[str] = None
+    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+JOBS: dict[str, JobState] = {}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------- SQLite ----------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    kind TEXT,
+    handle TEXT,
+    status TEXT,
+    scrape_json TEXT,
+    readout_json TEXT,
+    error TEXT,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT,
+    role TEXT,
+    content TEXT,
+    evidence TEXT,
+    created_at TEXT
+);
+"""
+
+
+async def db_init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(SCHEMA)
+        await db.commit()
+
+
+async def db_upsert_job(job: JobState):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO jobs "
+            "(job_id, kind, handle, status, scrape_json, readout_json, error, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (job.job_id, job.kind, job.handle, job.status,
+             json.dumps(job.scrape) if job.scrape else None,
+             json.dumps(job.readout) if job.readout else None,
+             job.error, job.created_at),
+        )
+        await db.commit()
+
+
+async def db_load_job(job_id: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await db.execute_fetchall(
+            "SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+        if not row:
+            return None
+        r = row[0]
+        return {
+            "job_id": r["job_id"], "kind": r["kind"], "handle": r["handle"],
+            "status": r["status"], "created_at": r["created_at"], "error": r["error"],
+            "scrape": json.loads(r["scrape_json"]) if r["scrape_json"] else None,
+            "readout": json.loads(r["readout_json"]) if r["readout_json"] else None,
+        }
+
+
+async def db_recent_self_readout(days: int = 30) -> Optional[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT readout_json FROM jobs WHERE kind = 'self' AND status = 'done' "
+            "AND created_at >= ? AND readout_json IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1", (cutoff,))
+        if not rows:
+            return None
+        return json.loads(rows[0]["readout_json"])
+
+
+async def db_recent_self_scrape(days: int = 30) -> Optional[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT scrape_json FROM jobs WHERE kind = 'self' AND status = 'done' "
+            "AND scrape_json IS NOT NULL AND created_at >= ? "
+            "ORDER BY created_at DESC LIMIT 1", (cutoff,))
+        if not rows:
+            return None
+        return json.loads(rows[0]["scrape_json"])
+
+
+async def db_history() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT job_id, kind, handle, readout_json, created_at "
+            "FROM jobs ORDER BY created_at DESC LIMIT 100")
+        out = []
+        for r in rows:
+            headline = None
+            if r["readout_json"]:
+                try:
+                    headline = json.loads(r["readout_json"]).get("headline")
+                except Exception:
+                    pass
+            out.append({"job_id": r["job_id"], "kind": r["kind"],
+                        "handle": r["handle"], "headline": headline,
+                        "created_at": r["created_at"]})
+        return out
+
+
+async def db_save_chat(job_id: str, role: str, content: str, evidence: Optional[str] = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO chat_messages (job_id, role, content, evidence, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (job_id, role, content, evidence, _now_iso()))
+        await db.commit()
+
+
+async def db_load_chat(job_id: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT role, content FROM chat_messages WHERE job_id = ? ORDER BY id",
+            (job_id,))
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+# ---------- SSE event helpers ----------
+def _push(job: JobState, event: dict):
+    """Push from the worker thread back into the asyncio queue on the main loop."""
+    if job.loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(job.queue.put(event), job.loop)
+
+
+def sse(event: dict) -> dict:
+    return {"event": "message", "data": json.dumps(event)}
+
+
+# ---------- scrape worker (runs in BackgroundTasks via to_thread) ----------
+def _scrape_worker(job_id: str):
+    """Synchronous worker — agent_scrape.scrape_self/target call asyncio.run internally."""
+    job = JOBS[job_id]
+
+    def narrate_cb(step: int, thinking: str, next_goal: str):
+        _push(job, {"type": "narration", "step": step,
+                    "thinking": thinking, "next_goal": next_goal})
+
+    try:
+        job.status = "scraping"
+        _push(job, {"type": "status", "status": "scraping"})
+        if job.kind == "self":
+            data = agent_scrape.scrape_self(job.handle, narrate=narrate_cb)
+        else:
+            data = agent_scrape.scrape_target(job.handle, narrate=narrate_cb)
+        job.scrape = data
+
+        job.status = "analyzing"
+        _push(job, {"type": "status", "status": "analyzing"})
+
+        if job.kind == "self":
+            readout = analyze.aura(data)
+        else:
+            # try to pair with the most recent cached self readout (last 30d)
+            fut = asyncio.run_coroutine_threadsafe(
+                _gather_prior_self(), job.loop) if job.loop else None
+            prior_self_scrape, prior_self_readout = fut.result() if fut else (None, None)
+            self_for_vibe = prior_self_scrape or {
+                "handle": "unknown", "header": {}, "grid": [], "reels": []}
+            readout = analyze.vibe(self_for_vibe, data, self_aura=prior_self_readout)
+
+        job.readout = readout
+        job.status = "done"
+        # persist
+        if job.loop:
+            asyncio.run_coroutine_threadsafe(db_upsert_job(job), job.loop).result()
+        _push(job, {"type": "done", "readout": readout})
+    except Exception as e:
+        job.status = "error"
+        job.error = f"{type(e).__name__}: {e}"
+        if job.loop:
+            asyncio.run_coroutine_threadsafe(db_upsert_job(job), job.loop).result()
+        _push(job, {"type": "error", "message": job.error})
+    finally:
+        _push(job, {"type": "__end__"})
+
+
+async def _gather_prior_self() -> tuple[Optional[dict], Optional[dict]]:
+    return await db_recent_self_scrape(), await db_recent_self_readout()
+
+
+# ---------- FastAPI app ----------
+app = FastAPI(title="instaclaw")
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.on_event("startup")
+async def _startup():
+    await db_init()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    idx = STATIC_DIR / "index.html"
+    if not idx.exists():
+        return HTMLResponse("<h1>instaclaw</h1><p>no static/index.html yet</p>")
+    return HTMLResponse(idx.read_text(encoding="utf-8"))
+
+
+# ---------- /scrape ----------
+class ScrapeBody(BaseModel):
+    kind: str
+    handle: str
+
+
+@app.post("/scrape")
+async def scrape(body: ScrapeBody, background: BackgroundTasks):
+    if body.kind not in ("self", "target"):
+        raise HTTPException(400, "kind must be 'self' or 'target'")
+    handle = body.handle.strip().lstrip("@")
+    if not handle:
+        raise HTTPException(400, "empty handle")
+    job_id = uuid.uuid4().hex[:12]
+    job = JobState(job_id=job_id, kind=body.kind, handle=handle,
+                   created_at=_now_iso(), loop=asyncio.get_event_loop())
+    JOBS[job_id] = job
+    await db_upsert_job(job)
+    background.add_task(asyncio.to_thread, _scrape_worker, job_id)
+    return {"job_id": job_id}
+
+
+# ---------- /jobs/{id} ----------
+def _job_to_response(job: JobState) -> dict:
+    headline = job.readout.get("headline") if job.readout else None
+    return {
+        "job_id": job.job_id, "status": job.status, "kind": job.kind,
+        "handle": job.handle, "created_at": job.created_at,
+        "scrape": job.scrape, "readout": job.readout,
+        "error": job.error, "headline": headline,
+    }
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    if job_id in JOBS:
+        return _job_to_response(JOBS[job_id])
+    row = await db_load_job(job_id)
+    if not row:
+        raise HTTPException(404, "no such job")
+    row["headline"] = row["readout"].get("headline") if row["readout"] else None
+    return row
+
+
+# ---------- /jobs/{id}/stream  (SSE for scrape progress) ----------
+@app.get("/jobs/{job_id}/stream")
+async def stream_job(job_id: str, request: Request):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+
+    async def gen():
+        yield sse({"type": "status", "status": job.status})
+        if job.status == "done" and job.readout:
+            yield sse({"type": "done", "readout": job.readout})
+            return
+        if job.status == "error":
+            yield sse({"type": "error", "message": job.error or ""})
+            return
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                evt = await asyncio.wait_for(job.queue.get(), timeout=20)
+            except asyncio.TimeoutError:
+                yield {"event": "ping", "data": "{}"}
+                continue
+            if evt.get("type") == "__end__":
+                break
+            yield sse(evt)
+
+    return EventSourceResponse(gen())
+
+
+# ---------- /chat (SSE) ----------
+class ChatBody(BaseModel):
+    job_id: str
+    message: str
+
+
+CHAT_TOOL = {
+    "name": "fetch_more",
+    "description": "Investigate the target's IG further to find specific evidence for the user's question. Use sparingly — only when the cached scrape and readout don't already answer it.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    },
+}
+
+
+def _chat_system(job: dict) -> str:
+    kind = job["kind"]
+    handle = job["handle"]
+    scrape = job.get("scrape") or {}
+    readout = job.get("readout") or {}
+    return f"""You are the user's sharpest friend, answering follow-up questions about
+@{handle}'s Instagram. You already wrote the readout below and have the full scrape.
+
+TARGET MODE: {kind}
+TARGET HANDLE: @{handle}
+
+CACHED SCRAPE:
+```json
+{json.dumps(scrape, ensure_ascii=False)[:80000]}
+```
+
+PRIOR READOUT YOU WROTE:
+```json
+{json.dumps(readout, ensure_ascii=False)[:20000]}
+```
+
+Rules:
+- Answer from the cached data when possible. Be specific — cite captions, comments, reels, audio.
+- If the answer truly requires fresh IG browsing (e.g. "who's that person in their stories",
+  "what's @x's deal", "are they at the same event as @y"), call the `fetch_more` tool with a
+  focused query. Don't call it for things you can already answer.
+- Tone matches the readout: observational, specific, faintly funny. Never mean.
+- Keep replies under ~200 words unless the user asks for more.
+"""
+
+
+async def _chat_stream(body: ChatBody, request: Request):
+    """SSE generator implementing the Anthropic tool-use loop."""
+    job_row = await db_load_job(body.job_id)
+    if job_row is None and body.job_id in JOBS:
+        job_row = _job_to_response(JOBS[body.job_id])
+    if job_row is None:
+        yield sse({"type": "message", "content": "(no such job)"})
+        yield sse({"type": "done"})
+        return
+
+    handle = job_row["handle"]
+    system = _chat_system(job_row)
+
+    # Build messages: prior conversation + this user message
+    history = await db_load_chat(body.job_id)
+    messages: list[dict] = [{"role": m["role"], "content": m["content"]} for m in history]
+    messages.append({"role": "user", "content": body.message})
+    await db_save_chat(body.job_id, "user", body.message)
+
+    final_text = ""
+    evidence_collected: list[str] = []
+
+    for _ in range(4):  # tool-use loop, capped
+        if await request.is_disconnected():
+            return
+        yield sse({"type": "thinking", "content": "thinking..."})
+
+        resp = await asyncio.to_thread(
+            anthropic_client.messages.create,
+            model=MODEL, max_tokens=1500, system=system,
+            tools=[CHAT_TOOL], messages=messages,
+        )
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        text_parts = [b.text for b in resp.content if b.type == "text"]
+
+        if not tool_uses:
+            final_text = "\n".join(t for t in text_parts if t).strip()
+            messages.append({"role": "assistant", "content": resp.content})
+            break
+
+        for t in text_parts:
+            if t.strip():
+                yield sse({"type": "thinking", "content": t.strip()})
+
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_results = []
+        for tu in tool_uses:
+            query = (tu.input or {}).get("query", "")
+            yield sse({"type": "fetching", "query": query})
+
+            loop = asyncio.get_event_loop()
+            narration_q: asyncio.Queue = asyncio.Queue()
+
+            def narrate_cb(step: int, thinking: str, next_goal: str, lp=loop, q=narration_q):
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "narration", "step": step,
+                           "thinking": thinking, "next_goal": next_goal}), lp)
+
+            scrape_task = asyncio.create_task(
+                agent_scrape.focused_scrape(query, handle, narrate=narrate_cb))
+            while not scrape_task.done():
+                try:
+                    yield sse(await asyncio.wait_for(narration_q.get(), timeout=1.0))
+                except asyncio.TimeoutError:
+                    pass
+                if await request.is_disconnected():
+                    scrape_task.cancel()
+                    return
+
+            evidence = await scrape_task
+            evidence_collected.append(evidence)
+            yield sse({"type": "evidence", "content": evidence})
+            tool_results.append({
+                "type": "tool_result", "tool_use_id": tu.id, "content": evidence})
+
+        messages.append({"role": "user", "content": tool_results})
+
+    if not final_text:
+        final_text = "(no reply)"
+    yield sse({"type": "message", "content": final_text})
+    await db_save_chat(body.job_id, "assistant", final_text,
+                       evidence="\n---\n".join(evidence_collected) or None)
+    yield sse({"type": "done"})
+
+
+@app.post("/chat")
+async def chat(body: ChatBody, request: Request):
+    return EventSourceResponse(_chat_stream(body, request))
+
+
+# ---------- /setup ----------
+def _open_login_window():
+    """Open a persistent-context Chrome window pointed at IG. Blocks this thread
+    until the user closes the window."""
+    from playwright.sync_api import sync_playwright
+    profile_dir = str(agent_scrape.PROFILE_DIR)
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=profile_dir, headless=False, channel="chrome",
+            viewport=None, args=["--start-maximized"],
+        )
+        page = ctx.new_page()
+        page.goto("https://www.instagram.com/")
+        # Wait for the user to close the window manually.
+        closed = threading.Event()
+        ctx.on("close", lambda: closed.set())
+        try:
+            while not closed.is_set():
+                closed.wait(timeout=2.0)
+                # If all pages went away, treat as closed.
+                if not ctx.pages:
+                    break
+        except Exception:
+            pass
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+@app.post("/setup/connect")
+async def setup_connect():
+    # fire-and-forget — don't await
+    asyncio.create_task(asyncio.to_thread(_open_login_window))
+    return {"status": "opened"}
+
+
+@app.get("/setup/check")
+async def setup_check():
+    base = agent_scrape.PROFILE_DIR / "Default"
+    for name in ("Cookies", "Cookies-journal"):
+        p = base / name
+        if p.exists() and p.stat().st_size > 0:
+            return {"connected": True}
+    return {"connected": False}
+
+
+# ---------- /history ----------
+@app.get("/history")
+async def history():
+    return {"jobs": await db_history()}
+
+
+# ---------- /readout/{job_id}/... ----------
+async def _readout_for(job_id: str) -> tuple[dict, Optional[str]]:
+    """Return (readout, target_handle_or_none) for rendering."""
+    job = JOBS.get(job_id)
+    if job and job.readout:
+        return job.readout, (job.handle if job.kind == "target" else None)
+    row = await db_load_job(job_id)
+    if not row or not row.get("readout"):
+        raise HTTPException(404, "no readout for that job")
+    target = row["handle"] if row["kind"] == "target" else None
+    return row["readout"], target
+
+
+@app.get("/readout/{job_id}/card.html", response_class=HTMLResponse)
+async def readout_card(job_id: str):
+    readout, target = await _readout_for(job_id)
+    return HTMLResponse(render_mod.render(readout, target_handle=target))
+
+
+@app.get("/readout/{job_id}/story.html", response_class=HTMLResponse)
+async def readout_story(job_id: str):
+    readout, target = await _readout_for(job_id)
+    return HTMLResponse(render_mod.render_story(readout, target_handle=target))
+
+
+@app.get("/readout/{job_id}/story.png")
+async def readout_story_png(job_id: str):
+    readout, target = await _readout_for(job_id)
+    png_path = OUT_DIR / f"job_{job_id}.story.png"
+    if not png_path.exists():
+        html_path = OUT_DIR / f"job_{job_id}.story.html"
+        html_path.write_text(render_mod.render_story(readout, target_handle=target),
+                             encoding="utf-8")
+        # screenshot is sync playwright — run off the event loop
+        await asyncio.to_thread(screenshot_mod.screenshot, html_path, png_path, "story")
+    return FileResponse(str(png_path), media_type="image/png")

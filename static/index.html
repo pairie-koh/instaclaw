@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>instaclaw</title>
+<meta name="viewport" content="width=1280">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --ink: #f4f1ea; --paper: #14110d; --rule: #2a261f;
+  --mute: #8a8273; --quiet: #5b5447; --accent: #ff5b1f;
+  --serif: 'Fraunces', 'Iowan Old Style', Georgia, serif;
+  --sans: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: var(--paper); color: var(--ink); font-family: var(--sans);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  min-height: 100vh; }
+
+/* layout shell */
+.shell { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
+
+/* top bar */
+.topbar { display: flex; align-items: center; justify-content: space-between;
+  padding: 28px 0 24px; border-bottom: 1px solid var(--rule); }
+.brand { font-family: var(--mono); font-size: 13px; letter-spacing: 0.22em;
+  text-transform: uppercase; color: var(--ink); display: flex; align-items: center; gap: 12px; }
+.brand .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 4px rgba(255,91,31,0.12); }
+.topnav { display: flex; align-items: center; gap: 28px; }
+.topnav button { background: none; border: 0; color: var(--mute); cursor: pointer;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+  text-transform: uppercase; padding: 4px 0; transition: color 0.15s ease; }
+.topnav button:hover { color: var(--ink); }
+.status { display: flex; align-items: center; gap: 10px; font-family: var(--mono);
+  font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--quiet); }
+.status .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--quiet);
+  transition: background 0.2s ease, box-shadow 0.2s ease; }
+.status[data-state="scraping"] .pulse,
+.status[data-state="analyzing"] .pulse,
+.status[data-state="chatting"] .pulse {
+  background: var(--accent);
+  box-shadow: 0 0 0 4px rgba(255,91,31,0.12);
+  animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(255,91,31,0.12); }
+  50% { box-shadow: 0 0 0 6px rgba(255,91,31,0.04); }
+}
+
+/* input bar */
+.input-bar { display: grid; grid-template-columns: 1fr auto; gap: 14px;
+  padding: 36px 0; border-bottom: 1px solid var(--rule); }
+.handle-wrap { position: relative; display: flex; align-items: center; }
+.handle-wrap::before { content: '@'; position: absolute; left: 18px;
+  font-family: var(--serif); font-style: italic; font-size: 22px; color: var(--quiet);
+  pointer-events: none; }
+.handle-input { width: 100%; background: transparent; border: 1px solid var(--rule);
+  color: var(--ink); font-family: var(--sans); font-size: 17px; font-weight: 400;
+  padding: 18px 18px 18px 42px; border-radius: 2px; outline: none;
+  transition: border-color 0.15s ease; }
+.handle-input::placeholder { color: var(--quiet); font-weight: 400; }
+.handle-input:focus { border-color: var(--mute); }
+.handle-input:disabled { opacity: 0.5; cursor: not-allowed; }
+.submit-btn { background: var(--accent); color: var(--paper); border: 0;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em;
+  text-transform: uppercase; padding: 0 32px; cursor: pointer; border-radius: 2px;
+  font-weight: 500; transition: opacity 0.15s ease; }
+.submit-btn:hover:not(:disabled) { opacity: 0.85; }
+.submit-btn:disabled { background: var(--rule); color: var(--quiet); cursor: not-allowed; }
+
+/* section labels */
+.section-eyebrow { display: flex; align-items: center; gap: 12px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--mute); margin: 36px 0 18px; }
+.section-eyebrow .live { color: var(--accent); }
+
+/* narration panel */
+.narration { display: none; font-family: var(--mono); font-size: 12.5px;
+  line-height: 1.7; color: #cbc4b3; background: rgba(255,255,255,0.015);
+  border: 1px solid var(--rule); border-radius: 2px; padding: 20px 24px;
+  max-height: 320px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+.narration.show { display: block; }
+.narration .step-num { color: var(--accent); }
+.narration .next { color: var(--quiet); padding-left: 8px; }
+.narration .err { color: #d96b4f; }
+.narration::-webkit-scrollbar { width: 6px; }
+.narration::-webkit-scrollbar-track { background: transparent; }
+.narration::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 3px; }
+
+/* card iframe */
+.card-wrap { display: none; margin: 36px 0 0; }
+.card-wrap.show { display: block; }
+.card-frame { width: 100%; border: 0; background: var(--paper);
+  display: block; min-height: 400px; }
+
+/* chat panel */
+.chat { display: none; margin: 48px 0 80px; padding-top: 36px;
+  border-top: 1px solid var(--rule); }
+.chat.show { display: block; }
+.chat-prompt { font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--mute); margin-bottom: 16px; }
+.chat-input-bar { display: grid; grid-template-columns: 1fr auto; gap: 12px;
+  margin-bottom: 24px; }
+.chat-input { background: transparent; border: 1px solid var(--rule); color: var(--ink);
+  font-family: var(--serif); font-size: 17px; font-style: italic;
+  padding: 16px 18px; border-radius: 2px; outline: none;
+  transition: border-color 0.15s ease; }
+.chat-input::placeholder { color: var(--quiet); font-style: italic; }
+.chat-input:focus { border-color: var(--mute); }
+.chat-input:disabled { opacity: 0.5; }
+.send-btn { background: transparent; color: var(--ink); border: 1px solid var(--ink);
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em;
+  text-transform: uppercase; padding: 0 24px; cursor: pointer; border-radius: 2px;
+  transition: background 0.15s ease, color 0.15s ease; }
+.send-btn:hover:not(:disabled) { background: var(--ink); color: var(--paper); }
+.send-btn:disabled { opacity: 0.4; cursor: not-allowed; border-color: var(--rule);
+  color: var(--quiet); }
+
+/* chat thread */
+.thread { display: flex; flex-direction: column; gap: 18px; }
+.turn { padding: 18px 0; border-bottom: 1px solid var(--rule); }
+.turn:last-child { border-bottom: 0; }
+.turn-user { font-family: var(--serif); font-style: italic; color: var(--mute);
+  font-size: 16px; line-height: 1.5; margin-bottom: 18px;
+  display: flex; gap: 12px; align-items: baseline; }
+.turn-user::before { content: '\203A'; color: var(--accent); font-style: normal;
+  font-family: var(--mono); font-size: 14px; }
+.trace { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.trace-thinking { font-family: var(--sans); font-style: italic; font-size: 12.5px;
+  color: var(--quiet); line-height: 1.55; }
+.trace-fetching { font-family: var(--mono); font-size: 11.5px; color: var(--accent);
+  letter-spacing: 0.04em; line-height: 1.6; }
+.trace-fetching::before { content: '\2192  '; }
+.trace-narration { font-family: var(--mono); font-size: 12px; color: #b3ac9c;
+  line-height: 1.6; padding-left: 14px; }
+.trace-narration::before { content: '\00B7  '; color: var(--quiet); }
+.trace-evidence { font-family: var(--sans); font-size: 13.5px; color: var(--ink);
+  line-height: 1.6; padding: 12px 16px; margin: 6px 0;
+  border-left: 2px solid var(--accent); background: rgba(255,91,31,0.03);
+  border-radius: 0 2px 2px 0; }
+.trace-evidence .evidence-label { font-family: var(--mono); font-size: 9.5px;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent);
+  display: block; margin-bottom: 6px; }
+.reply { font-family: var(--serif); font-weight: 400; font-size: 19px;
+  line-height: 1.55; color: var(--ink); font-variation-settings: 'opsz' 36;
+  margin-top: 18px; }
+
+/* history drawer */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 40;
+  opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
+.scrim.show { opacity: 1; pointer-events: auto; }
+.drawer { position: fixed; top: 0; left: 0; bottom: 0; width: 360px;
+  background: #100d09; border-right: 1px solid var(--rule); z-index: 50;
+  transform: translateX(-100%); transition: transform 0.25s ease;
+  display: flex; flex-direction: column; }
+.drawer.show { transform: translateX(0); }
+.drawer-head { padding: 28px 28px 20px; border-bottom: 1px solid var(--rule);
+  display: flex; align-items: center; justify-content: space-between; }
+.drawer-head .label { font-family: var(--mono); font-size: 11px;
+  letter-spacing: 0.22em; text-transform: uppercase; color: var(--ink); }
+.drawer-head .close { background: none; border: 0; color: var(--mute); cursor: pointer;
+  font-family: var(--mono); font-size: 22px; line-height: 1; }
+.drawer-head .close:hover { color: var(--ink); }
+.history-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+.history-empty { padding: 32px 28px; font-family: var(--serif); font-style: italic;
+  color: var(--quiet); font-size: 15px; line-height: 1.5; }
+.history-item { display: block; width: 100%; text-align: left; background: none;
+  border: 0; padding: 18px 28px; cursor: pointer; border-bottom: 1px solid var(--rule);
+  color: var(--ink); transition: background 0.12s ease; }
+.history-item:hover { background: rgba(255,255,255,0.02); }
+.history-item .h-handle { font-family: var(--mono); font-size: 11px;
+  letter-spacing: 0.14em; text-transform: lowercase; color: var(--accent);
+  margin-bottom: 6px; }
+.history-item .h-headline { font-family: var(--serif); font-size: 15px; line-height: 1.35;
+  color: var(--ink); margin-bottom: 6px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; }
+.history-item .h-date { font-family: var(--mono); font-size: 9.5px;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--quiet); }
+
+/* connect modal */
+.modal-scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.78);
+  z-index: 100; display: none; align-items: center; justify-content: center;
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.modal-scrim.show { display: flex; }
+.modal { max-width: 460px; background: #16130e; border: 1px solid var(--rule);
+  border-radius: 4px; padding: 44px 44px 36px;
+  box-shadow: 0 40px 80px -40px rgba(0,0,0,0.8); }
+.modal .eyebrow { font-family: var(--mono); font-size: 11px;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--mute);
+  margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
+.modal .eyebrow .dot { width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 4px rgba(255,91,31,0.12); }
+.modal h2 { font-family: var(--serif); font-weight: 400; font-size: 28px;
+  line-height: 1.15; letter-spacing: -0.018em; color: var(--ink);
+  font-variation-settings: 'opsz' 48; margin-bottom: 16px; }
+.modal p { font-family: var(--serif); font-style: italic; font-size: 16px;
+  line-height: 1.5; color: var(--mute); margin-bottom: 32px; max-width: 36ch; }
+.modal-btn { background: var(--accent); color: var(--paper); border: 0;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em;
+  text-transform: uppercase; padding: 14px 28px; cursor: pointer; border-radius: 2px;
+  font-weight: 500; transition: opacity 0.15s ease; }
+.modal-btn:hover:not(:disabled) { opacity: 0.85; }
+.modal-btn:disabled { background: var(--rule); color: var(--quiet); cursor: not-allowed; }
+.modal-status { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--quiet); margin-top: 18px;
+  display: none; align-items: center; gap: 10px; }
+.modal-status.show { display: flex; }
+.modal-status .spinner { width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+
+/* empty state */
+.empty { display: flex; flex-direction: column; align-items: center;
+  text-align: center; padding: 96px 24px 40px; color: var(--mute); }
+.empty.hide { display: none; }
+.empty h1 { font-family: var(--serif); font-weight: 400; font-size: 48px;
+  line-height: 1.05; letter-spacing: -0.018em; color: var(--ink);
+  font-variation-settings: 'opsz' 96; max-width: 18ch; margin-bottom: 18px; }
+.empty h1 em { font-style: italic; color: var(--accent); font-weight: 500; }
+.empty p { font-family: var(--serif); font-style: italic; font-size: 17px;
+  line-height: 1.5; color: var(--mute); max-width: 36ch; }
+</style>
+</head>
+<body>
+
+<!-- connect modal -->
+<div class="modal-scrim" id="setup-modal">
+  <div class="modal">
+    <div class="eyebrow"><span class="dot"></span><span>First-run setup</span></div>
+    <h2>Connect your Instagram to get started.</h2>
+    <p id="setup-copy">Instaclaw runs locally and uses your own session. Click below and log in &mdash; we'll wait.</p>
+    <button class="modal-btn" id="setup-btn">Connect Instagram</button>
+    <div class="modal-status" id="setup-status">
+      <span class="spinner"></span><span>Logging in&hellip; close the IG window when you're done.</span>
+    </div>
+  </div>
+</div>
+
+<!-- history drawer -->
+<div class="scrim" id="drawer-scrim"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span class="label">History</span>
+    <button class="close" id="drawer-close" aria-label="close">&times;</button>
+  </div>
+  <div class="history-list" id="history-list">
+    <div class="history-empty">No vibe checks yet.</div>
+  </div>
+</aside>
+
+<!-- main shell -->
+<div class="shell">
+
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span><span>instaclaw</span></div>
+    <div class="topnav">
+      <div class="status" id="status" data-state="idle">
+        <span class="pulse"></span><span id="status-text">Idle</span>
+      </div>
+      <button id="open-history">History</button>
+      <button id="open-settings">Settings</button>
+    </div>
+  </header>
+
+  <div class="input-bar">
+    <div class="handle-wrap">
+      <input type="text" class="handle-input" id="handle" placeholder="enter a handle" autocomplete="off" spellcheck="false">
+    </div>
+    <button class="submit-btn" id="submit-btn">Vibe check</button>
+  </div>
+
+  <div class="empty" id="empty">
+    <h1>What's the <em>vibe</em>?</h1>
+    <p>Drop a handle. We'll watch the agent navigate, mine the reels, and surface the readout.</p>
+  </div>
+
+  <div class="section-eyebrow" id="narration-eyebrow" style="display:none;">
+    <span class="live">&#9679;</span><span>Agent &middot; live</span>
+  </div>
+  <pre class="narration" id="narration"></pre>
+
+  <div class="card-wrap" id="card-wrap">
+    <iframe class="card-frame" id="card-frame" title="readout card"></iframe>
+  </div>
+
+  <section class="chat" id="chat">
+    <div class="chat-prompt">Ask a follow-up</div>
+    <div class="chat-input-bar">
+      <input type="text" class="chat-input" id="chat-input" placeholder="wait, are they actually dating @sara_xy?" autocomplete="off">
+      <button class="send-btn" id="chat-send">Send</button>
+    </div>
+    <div class="thread" id="thread"></div>
+  </section>
+
+</div>
+
+<script>
+// ───────── state ─────────
+const state = {
+  jobId: null,
+  scrapeStream: null,   // EventSource
+  chatAbort: null,      // AbortController for in-flight chat
+  narrationStep: 0,
+  narrationMax: 100,
+};
+
+// ───────── el shortcuts ─────────
+const $ = (id) => document.getElementById(id);
+const handleInput = $('handle');
+const submitBtn = $('submit-btn');
+const narration = $('narration');
+const narrationEyebrow = $('narration-eyebrow');
+const cardWrap = $('card-wrap');
+const cardFrame = $('card-frame');
+const chat = $('chat');
+const chatInput = $('chat-input');
+const chatSend = $('chat-send');
+const thread = $('thread');
+const empty = $('empty');
+const statusEl = $('status');
+const statusText = $('status-text');
+const setupModal = $('setup-modal');
+const setupBtn = $('setup-btn');
+const setupStatus = $('setup-status');
+const drawer = $('drawer');
+const drawerScrim = $('drawer-scrim');
+const historyList = $('history-list');
+
+// ───────── status ─────────
+const STATUS_LABELS = { idle: 'Idle', scraping: 'Scraping', analyzing: 'Analyzing', chatting: 'Chatting' };
+function setStatus(s) {
+  statusEl.dataset.state = s;
+  statusText.textContent = STATUS_LABELS[s] || s;
+}
+
+// ───────── handle normalize ─────────
+function normalizeHandle(raw) {
+  return (raw || '').trim().replace(/^@+/, '').toLowerCase();
+}
+
+// ───────── narration ─────────
+function pushNarration(thinking, nextGoal, isError) {
+  state.narrationStep += 1;
+  const n = state.narrationStep.toString().padStart(2, '0');
+  const line = document.createElement('div');
+  if (isError) line.className = 'err';
+  line.innerHTML = '<span class="step-num">&gt;&gt;&gt; [' + n + ']</span> ' + escapeHtml(thinking || '');
+  narration.appendChild(line);
+  if (nextGoal) {
+    const sub = document.createElement('div');
+    sub.className = 'next';
+    sub.textContent = 'next: ' + nextGoal;
+    narration.appendChild(sub);
+  }
+  while (narration.children.length > state.narrationMax) {
+    narration.removeChild(narration.firstChild);
+  }
+  narration.scrollTop = narration.scrollHeight;
+}
+function resetNarration() {
+  narration.innerHTML = '';
+  state.narrationStep = 0;
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ───────── iframe auto-resize ─────────
+function fitFrame() {
+  try {
+    const doc = cardFrame.contentDocument;
+    if (!doc || !doc.body) return;
+    const h = Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight);
+    cardFrame.style.height = (h + 8) + 'px';
+  } catch (e) { /* cross-origin: leave min-height */ }
+}
+cardFrame.addEventListener('load', () => {
+  fitFrame();
+  // Re-measure after fonts settle (Fraunces is variable and lazy).
+  setTimeout(fitFrame, 120);
+  setTimeout(fitFrame, 400);
+  setTimeout(fitFrame, 1200);
+  try {
+    const win = cardFrame.contentWindow;
+    if (win && 'ResizeObserver' in win) {
+      const ro = new win.ResizeObserver(fitFrame);
+      ro.observe(cardFrame.contentDocument.body);
+    }
+  } catch (e) {}
+});
+window.addEventListener('resize', fitFrame);
+
+// ───────── scrape flow ─────────
+async function startScrape() {
+  const handle = normalizeHandle(handleInput.value);
+  if (!handle) { handleInput.focus(); return; }
+  if (!/^[a-z0-9._]{1,30}$/.test(handle)) {
+    revealNarration();
+    pushNarration('invalid handle — letters, numbers, dot, underscore only.', null, true);
+    return;
+  }
+
+  // Tear down any prior session.
+  if (state.scrapeStream) { state.scrapeStream.close(); state.scrapeStream = null; }
+  if (state.chatAbort) { state.chatAbort.abort(); state.chatAbort = null; }
+  resetNarration();
+  cardWrap.classList.remove('show');
+  chat.classList.remove('show');
+  thread.innerHTML = '';
+  empty.classList.add('hide');
+  revealNarration();
+
+  submitBtn.disabled = true;
+  handleInput.disabled = true;
+  setStatus('scraping');
+
+  let resp;
+  try {
+    resp = await fetch('/scrape', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'target', handle }),
+    });
+  } catch (e) {
+    pushNarration('network error: ' + e.message, null, true);
+    resetSubmit();
+    return;
+  }
+  if (!resp.ok) {
+    pushNarration('scrape failed: HTTP ' + resp.status, null, true);
+    resetSubmit();
+    return;
+  }
+  const body = await resp.json();
+  state.jobId = body.job_id;
+  openScrapeStream(state.jobId);
+}
+
+function revealNarration() {
+  narrationEyebrow.style.display = 'flex';
+  narration.classList.add('show');
+  empty.classList.add('hide');
+}
+
+function openScrapeStream(jobId) {
+  const es = new EventSource('/jobs/' + encodeURIComponent(jobId) + '/stream');
+  state.scrapeStream = es;
+  es.onmessage = (ev) => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    handleScrapeEvent(data);
+  };
+  es.onerror = () => {
+    // EventSource auto-reconnects on transient drops; backend should close on done.
+  };
+}
+
+function handleScrapeEvent(ev) {
+  switch (ev.type) {
+    case 'status':
+      if (ev.status === 'analyzing') setStatus('analyzing');
+      else if (ev.status === 'scraping') setStatus('scraping');
+      break;
+    case 'narration':
+      pushNarration(ev.thinking || ev.message || '', ev.next_goal || ev.next || null, false);
+      break;
+    case 'done':
+      finishScrape(state.jobId, false);
+      break;
+    case 'error':
+      pushNarration(ev.message || 'agent error', null, true);
+      finishScrape(state.jobId, true);
+      break;
+  }
+}
+
+function finishScrape(jobId, errored) {
+  if (state.scrapeStream) { state.scrapeStream.close(); state.scrapeStream = null; }
+  resetSubmit();
+  if (errored || !jobId) { setStatus('idle'); return; }
+  cardFrame.src = '/readout/' + encodeURIComponent(jobId) + '/card.html';
+  cardWrap.classList.add('show');
+  chat.classList.add('show');
+  setStatus('idle');
+  loadHistory();
+}
+
+function resetSubmit() {
+  submitBtn.disabled = false;
+  handleInput.disabled = false;
+}
+
+// ───────── chat flow (POST + SSE) ─────────
+// EventSource only supports GET, so for POST /chat we hand-roll an SSE parser
+// over a fetch ReadableStream. Frames are split on a blank line (\n\n).
+async function sendChat() {
+  const msg = chatInput.value.trim();
+  if (!msg || !state.jobId) return;
+
+  chatSend.disabled = true;
+  chatInput.disabled = true;
+  setStatus('chatting');
+
+  const turn = document.createElement('div');
+  turn.className = 'turn';
+  const userLine = document.createElement('div');
+  userLine.className = 'turn-user';
+  userLine.textContent = msg;
+  turn.appendChild(userLine);
+  const trace = document.createElement('div');
+  trace.className = 'trace';
+  turn.appendChild(trace);
+  thread.appendChild(turn);
+  chatInput.value = '';
+  turn.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+  state.chatAbort = new AbortController();
+
+  let resp;
+  try {
+    resp = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+      body: JSON.stringify({ job_id: state.jobId, message: msg }),
+      signal: state.chatAbort.signal,
+    });
+  } catch (e) {
+    appendTrace(trace, 'thinking', 'network error: ' + e.message);
+    endChatTurn();
+    return;
+  }
+  if (!resp.ok || !resp.body) {
+    appendTrace(trace, 'thinking', 'chat failed: HTTP ' + resp.status);
+    endChatTurn();
+    return;
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  let gotDone = false;
+
+  try {
+    outer: while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // Frame boundary: blank line. Tolerate both \n\n and \r\n\r\n.
+      let m;
+      const boundary = /\r?\n\r?\n/;
+      while ((m = buf.match(boundary))) {
+        const idx = m.index;
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + m[0].length);
+        const payload = parseSseFrame(frame);
+        if (payload === null) continue;
+        let ev;
+        try { ev = JSON.parse(payload); } catch { continue; }
+        renderChatEvent(turn, trace, ev);
+        if (ev.type === 'done') { gotDone = true; break outer; }
+      }
+    }
+    // Flush any trailing single frame without a closing blank line.
+    if (!gotDone && buf.trim()) {
+      const payload = parseSseFrame(buf);
+      if (payload !== null) {
+        try {
+          const ev = JSON.parse(payload);
+          renderChatEvent(turn, trace, ev);
+        } catch {}
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      appendTrace(trace, 'thinking', 'stream error: ' + e.message);
+    }
+  }
+  endChatTurn();
+}
+
+// Per SSE spec, multiple `data:` lines in one frame concatenate with \n.
+function parseSseFrame(frame) {
+  const lines = frame.split(/\r?\n/);
+  const dataLines = [];
+  for (const line of lines) {
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+    // event:, id:, retry: ignored — backend uses default `message` events.
+  }
+  if (!dataLines.length) return null;
+  return dataLines.join('\n');
+}
+
+function renderChatEvent(turn, trace, ev) {
+  switch (ev.type) {
+    case 'thinking':
+      appendTrace(trace, 'thinking', ev.content || ev.message || ev.text || '');
+      break;
+    case 'fetching':
+      appendTrace(trace, 'fetching', 'investigating: ' + (ev.query || ev.message || ''));
+      break;
+    case 'narration':
+      appendTrace(trace, 'narration', ev.thinking || ev.message || '');
+      break;
+    case 'evidence': {
+      const el = document.createElement('div');
+      el.className = 'trace-evidence';
+      el.innerHTML = '<span class="evidence-label">Evidence</span>' + escapeHtml(ev.content || ev.text || ev.message || '');
+      trace.appendChild(el);
+      break;
+    }
+    case 'message': {
+      const reply = document.createElement('div');
+      reply.className = 'reply';
+      reply.textContent = ev.content || ev.text || ev.message || '';
+      turn.appendChild(reply);
+      break;
+    }
+    case 'done':
+      break;
+    case 'error':
+      appendTrace(trace, 'thinking', 'error: ' + (ev.message || 'unknown'));
+      break;
+  }
+  turn.scrollIntoView({ behavior: 'smooth', block: 'end' });
+}
+
+function appendTrace(trace, kind, text) {
+  const div = document.createElement('div');
+  div.className = 'trace-' + kind;
+  div.textContent = text;
+  trace.appendChild(div);
+}
+
+function endChatTurn() {
+  chatSend.disabled = false;
+  chatInput.disabled = false;
+  setStatus('idle');
+  state.chatAbort = null;
+  chatInput.focus();
+}
+
+// ───────── history ─────────
+async function loadHistory() {
+  try {
+    const resp = await fetch('/history');
+    if (!resp.ok) return;
+    const body = await resp.json();
+    renderHistory(body.jobs || []);
+  } catch (e) { /* silent */ }
+}
+
+function renderHistory(jobs) {
+  if (!jobs.length) {
+    historyList.innerHTML = '<div class="history-empty">No vibe checks yet.</div>';
+    return;
+  }
+  historyList.innerHTML = '';
+  for (const j of jobs) {
+    const btn = document.createElement('button');
+    btn.className = 'history-item';
+    btn.innerHTML =
+      '<div class="h-handle">@' + escapeHtml(j.handle || '') + '</div>' +
+      '<div class="h-headline">' + escapeHtml(j.headline || '(no headline)') + '</div>' +
+      '<div class="h-date">' + escapeHtml(formatDate(j.created_at)) + '</div>';
+    btn.addEventListener('click', () => loadHistoricalJob(j));
+    historyList.appendChild(btn);
+  }
+}
+
+function formatDate(s) {
+  if (!s) return '';
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch { return s; }
+}
+
+function loadHistoricalJob(j) {
+  state.jobId = j.job_id;
+  if (state.chatAbort) { state.chatAbort.abort(); state.chatAbort = null; }
+  if (state.scrapeStream) { state.scrapeStream.close(); state.scrapeStream = null; }
+  resetNarration();
+  narrationEyebrow.style.display = 'none';
+  narration.classList.remove('show');
+  empty.classList.add('hide');
+  thread.innerHTML = '';
+  handleInput.value = j.handle || '';
+  cardFrame.src = '/readout/' + encodeURIComponent(j.job_id) + '/card.html';
+  cardWrap.classList.add('show');
+  chat.classList.add('show');
+  closeDrawer();
+  setStatus('idle');
+}
+
+// ───────── drawer ─────────
+function openDrawer() {
+  drawer.classList.add('show');
+  drawerScrim.classList.add('show');
+  loadHistory();
+}
+function closeDrawer() {
+  drawer.classList.remove('show');
+  drawerScrim.classList.remove('show');
+}
+
+// ───────── setup gate ─────────
+let setupPoll = null;
+async function checkSetup() {
+  try {
+    const resp = await fetch('/setup/check');
+    if (!resp.ok) return false;
+    const body = await resp.json();
+    return !!body.connected;
+  } catch { return false; }
+}
+
+async function gateSetup() {
+  const ok = await checkSetup();
+  if (ok) { setupModal.classList.remove('show'); return; }
+  setupModal.classList.add('show');
+}
+
+async function connectInstagram() {
+  setupBtn.disabled = true;
+  setupStatus.classList.add('show');
+  try {
+    // Fire-and-forget — the backend opens a browser window and returns immediately.
+    await fetch('/setup/connect', { method: 'POST' });
+  } catch (e) { /* fire-and-forget */ }
+  if (setupPoll) clearInterval(setupPoll);
+  setupPoll = setInterval(async () => {
+    const ok = await checkSetup();
+    if (ok) {
+      clearInterval(setupPoll); setupPoll = null;
+      setupModal.classList.remove('show');
+      setupBtn.disabled = false;
+      setupStatus.classList.remove('show');
+    }
+  }, 3000);
+}
+
+// ───────── settings (reuses modal) ─────────
+async function openSettings() {
+  const ok = await checkSetup();
+  setupBtn.disabled = false;
+  setupStatus.classList.remove('show');
+  $('setup-copy').textContent = ok
+    ? 'Already connected. Re-connect to refresh your IG session.'
+    : "Instaclaw runs locally and uses your own session. Click below and log in — we'll wait.";
+  setupBtn.textContent = ok ? 'Re-connect Instagram' : 'Connect Instagram';
+  setupModal.classList.add('show');
+}
+
+// ───────── wiring ─────────
+submitBtn.addEventListener('click', startScrape);
+handleInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') startScrape(); });
+chatSend.addEventListener('click', sendChat);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+$('open-history').addEventListener('click', openDrawer);
+$('drawer-close').addEventListener('click', closeDrawer);
+drawerScrim.addEventListener('click', closeDrawer);
+$('open-settings').addEventListener('click', openSettings);
+setupBtn.addEventListener('click', connectInstagram);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeDrawer();
+});
+
+// ───────── boot ─────────
+gateSetup();
+loadHistory();
+handleInput.focus();
+</script>
+</body>
+</html>

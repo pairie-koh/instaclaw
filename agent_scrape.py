@@ -6,13 +6,16 @@ Keys: mode, handle, header, grid, reels, tagged, saved (self only), private (tar
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from pydantic import BaseModel, Field
 
 from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.agent.views import AgentOutput
+
+# Narrate callback signature used by the web layer: (step, thinking, next_goal).
+NarrateCb = Optional[Callable[[int, str, str], None]]
 
 ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
@@ -64,6 +67,19 @@ def _narrate(state: BrowserStateSummary, output: AgentOutput, step: int) -> None
         print(f">>> [{step}] {cs.thinking.strip()}")
     if cs.next_goal:
         print(f">>> [{step}] next: {cs.next_goal.strip()}")
+
+
+def _make_callback(extra: NarrateCb):
+    """Wrap stdout _narrate + an optional (step, thinking, next_goal) callback."""
+    def cb(state: BrowserStateSummary, output: AgentOutput, step: int) -> None:
+        _narrate(state, output, step)
+        if extra is not None:
+            cs = output.current_state
+            try:
+                extra(step, (cs.thinking or "").strip(), (cs.next_goal or "").strip())
+            except Exception as e:
+                print(f">>> [narrate-cb error] {e}")
+    return cb
 
 
 # ---------- shared task prompt fragments ----------
@@ -188,7 +204,7 @@ def _to_dict(result: ScrapeResult, mode: str, handle: str) -> dict:
     return d
 
 
-async def _run(task: str, mode: str, handle: str) -> dict:
+async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
     browser = _browser()
     llm = ChatAnthropic(model=MODEL)
     agent = Agent(
@@ -196,7 +212,7 @@ async def _run(task: str, mode: str, handle: str) -> dict:
         llm=llm,
         browser=browser,
         output_model_schema=ScrapeResult,
-        register_new_step_callback=_narrate,
+        register_new_step_callback=_make_callback(narrate),
         max_actions_per_step=5,
         use_vision=True,
     )
@@ -222,16 +238,48 @@ def _write(data: dict, mode: str, handle: str) -> dict:
     return data
 
 
-def scrape_self(handle: str) -> dict:
+def scrape_self(handle: str, narrate: NarrateCb = None) -> dict:
     print(f">>> starting self-scrape for @{handle}")
-    data = asyncio.run(_run(_self_task(handle), "self", handle))
+    data = asyncio.run(_run(_self_task(handle), "self", handle, narrate=narrate))
     return _write(data, "self", handle)
 
 
-def scrape_target(handle: str) -> dict:
+def scrape_target(handle: str, narrate: NarrateCb = None) -> dict:
     print(f">>> starting target-scrape for @{handle}")
-    data = asyncio.run(_run(_target_task(handle), "target", handle))
+    data = asyncio.run(_run(_target_task(handle), "target", handle, narrate=narrate))
     return _write(data, "target", handle)
+
+
+# ---------- focused investigation used by the chat layer ----------
+async def focused_scrape(query: str, base_handle: str, narrate: NarrateCb = None) -> str:
+    """Open browser-use agent for a follow-up question. Returns prose evidence."""
+    task = f"""You are investigating Instagram for a follow-up question about @{base_handle}.
+
+QUESTION: {query}
+
+Start at https://www.instagram.com/{base_handle}/. You may navigate to other
+profiles they interact with (frequent commenters, tagged accounts, people they
+repost). Read posts, captions, comments, and reels as needed.
+
+{GLOBAL_RULES}
+
+Return your answer as PROSE EVIDENCE — not JSON. Cite specific posts (URL path),
+specific commenters (@handle), specific reels, captions, or audio tracks you saw.
+If you couldn't find an answer, say so plainly and describe what you did look at.
+Keep it under ~400 words. No speculation beyond what's visible.
+"""
+    browser = _browser()
+    llm = ChatAnthropic(model=MODEL)
+    agent = Agent(
+        task=task,
+        llm=llm,
+        browser=browser,
+        register_new_step_callback=_make_callback(narrate),
+        max_actions_per_step=5,
+        use_vision=True,
+    )
+    history = await agent.run()
+    return (history.final_result() or "").strip() or "(no evidence found)"
 
 
 if __name__ == "__main__":
