@@ -236,6 +236,16 @@ html, body { background: var(--paper); color: var(--ink); font-family: var(--san
     <div class="modal-status" id="setup-status">
       <span class="spinner"></span><span>Logging in&hellip; close the IG window when you're done.</span>
     </div>
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--rule);">
+      <div class="eyebrow" style="margin-bottom:6px;"><span>Your handle</span></div>
+      <p style="font-size:13px;color:var(--mute);margin-bottom:10px;">Step 1: save your handle. Step 2: scrape your own profile once. Compatibility checks then run against your saved vibe.</p>
+      <input type="text" class="handle-input" id="self-handle" placeholder="your.handle" autocomplete="off" spellcheck="false" style="width:100%;">
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+        <button class="modal-btn" id="save-self-handle" style="background:transparent;border:1px solid var(--rule);color:var(--ink);flex:1;min-width:120px;">Save handle</button>
+        <button class="modal-btn" id="scrape-self-btn" style="flex:1;min-width:160px;">Scrape my vibe</button>
+      </div>
+      <div id="self-scrape-status" style="font-size:12px;color:var(--mute);margin-top:8px;"></div>
+    </div>
   </div>
 </div>
 
@@ -417,12 +427,18 @@ async function startScrape() {
   handleInput.disabled = true;
   setStatus('scraping');
 
+  const selfHandle = (localStorage.getItem('instaclaw_self_handle') || '').trim();
+  if (!selfHandle) {
+    pushNarration('no "your handle" saved — open Settings and set yours so the readout can compare.', null, true);
+    resetSubmit();
+    return;
+  }
   let resp;
   try {
     resp = await fetch('/scrape', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'target', handle }),
+      body: JSON.stringify({ kind: 'target', handle, self_handle: selfHandle }),
     });
   } catch (e) {
     pushNarration('network error: ' + e.message, null, true);
@@ -463,6 +479,18 @@ function handleScrapeEvent(ev) {
     case 'status':
       if (ev.status === 'analyzing') setStatus('analyzing');
       else if (ev.status === 'scraping') setStatus('scraping');
+      // Phase banner: 'self' or 'target' lets the user know which profile is being mined.
+      if (ev.phase === 'self') {
+        const line = document.createElement('div');
+        line.className = 'next';
+        line.textContent = '── scraping you ──';
+        narration.appendChild(line);
+      } else if (ev.phase === 'target') {
+        const line = document.createElement('div');
+        line.className = 'next';
+        line.textContent = '── scraping target ──';
+        narration.appendChild(line);
+      }
       break;
     case 'narration':
       pushNarration(ev.thinking || ev.message || '', ev.next_goal || ev.next || null, false);
@@ -767,6 +795,66 @@ $('drawer-close').addEventListener('click', closeDrawer);
 drawerScrim.addEventListener('click', closeDrawer);
 $('open-settings').addEventListener('click', openSettings);
 setupBtn.addEventListener('click', connectInstagram);
+
+// ───────── self handle persistence ─────────
+const selfHandleInput = $('self-handle');
+const selfStatus = $('self-scrape-status');
+selfHandleInput.value = localStorage.getItem('instaclaw_self_handle') || '';
+$('save-self-handle').addEventListener('click', () => {
+  const v = normalizeHandle(selfHandleInput.value);
+  if (!v) { selfHandleInput.focus(); return; }
+  if (!/^[a-z0-9._]{1,30}$/.test(v)) {
+    selfHandleInput.style.borderColor = '#ff5b1f';
+    setTimeout(() => { selfHandleInput.style.borderColor = ''; }, 1500);
+    return;
+  }
+  localStorage.setItem('instaclaw_self_handle', v);
+  selfHandleInput.value = v;
+  const btn = $('save-self-handle');
+  const orig = btn.textContent;
+  btn.textContent = 'Saved ✓';
+  setTimeout(() => { btn.textContent = orig; }, 1200);
+});
+
+$('scrape-self-btn').addEventListener('click', async () => {
+  const v = normalizeHandle(selfHandleInput.value) || localStorage.getItem('instaclaw_self_handle');
+  if (!v || !/^[a-z0-9._]{1,30}$/.test(v)) {
+    selfStatus.textContent = 'Save a valid handle first.';
+    return;
+  }
+  localStorage.setItem('instaclaw_self_handle', v);
+  // Close the settings modal so the user can watch the narration unfold.
+  setupModal.classList.remove('show');
+  resetNarration();
+  cardWrap.classList.remove('show');
+  chat.classList.remove('show');
+  thread.innerHTML = '';
+  empty.classList.add('hide');
+  revealNarration();
+  setStatus('scraping');
+  submitBtn.disabled = true;
+  handleInput.disabled = true;
+  let resp;
+  try {
+    resp = await fetch('/scrape', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'self', handle: v }),
+    });
+  } catch (e) {
+    pushNarration('network error: ' + e.message, null, true);
+    resetSubmit();
+    return;
+  }
+  if (!resp.ok) {
+    pushNarration('self scrape failed: HTTP ' + resp.status, null, true);
+    resetSubmit();
+    return;
+  }
+  const body = await resp.json();
+  state.jobId = body.job_id;
+  openScrapeStream(state.jobId);
+});
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeDrawer();
 });

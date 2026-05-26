@@ -21,7 +21,7 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = "claude-opus-4-7"
+MODEL = "claude-sonnet-4-6"
 
 
 # ---------- output schema (agent returns this verbatim via structured output) ----------
@@ -49,6 +49,17 @@ class UrlOnly(BaseModel):
     url: str = ""
 
 
+class Highlight(BaseModel):
+    title: str = ""           # e.g. "Bali 24", "❤", "fits"
+    cover_text: str = ""      # any text visible on the cover bubble
+    slides: list[str] = Field(default_factory=list)  # text/captions seen inside the highlight reel
+
+
+class Follow(BaseModel):
+    handle: str = ""
+    display_name: str = ""
+
+
 class ScrapeResult(BaseModel):
     mode: str
     handle: str
@@ -57,6 +68,9 @@ class ScrapeResult(BaseModel):
     grid: list[Post] = Field(default_factory=list)
     reels: list[Reel] = Field(default_factory=list)
     tagged: list[UrlOnly] = Field(default_factory=list)
+    highlights: list[Highlight] = Field(default_factory=list)
+    following: list[Follow] = Field(default_factory=list)  # who they follow
+    mutuals: list[Follow] = Field(default_factory=list)    # target mode: "Followers you follow"
     saved: Optional[list[UrlOnly]] = None
 
 
@@ -111,7 +125,10 @@ Return your final result as JSON matching this exact shape:
   "grid":   [ {"url": "/p/.../", "caption": "...", "comments": ["...", ...], "likes_raw": "..."} ],
   "reels":  [ {"url": "/reel/.../", "caption": "...", "creator": "<@handle of original poster>", "audio": "<audio track name>"} ],
   "tagged": [ {"url": "/p/.../"} ],
-  "saved":  [ {"url": "/p/.../"} ]        // SELF mode only — omit for target
+  "highlights": [ {"title": "<bubble title>", "cover_text": "<text on cover>", "slides": ["<caption / overlay text seen inside>", "..."]} ],
+  "following": [ {"handle": "@example", "display_name": "..."} ],
+  "mutuals":   [ {"handle": "@example", "display_name": "..."} ],   // TARGET mode only — "Followers you follow"
+  "saved":     [ {"url": "/p/.../"} ]                                // SELF mode only — omit for target
 }
 """
 
@@ -139,6 +156,21 @@ Go to https://www.instagram.com/{handle}/ and collect the following surfaces, in
 
 5. SAVED — go to /{handle}/saved/all-posts/ and collect the URL paths of the 20
    most recently saved items. URLs only.
+
+6. STORY HIGHLIGHTS — back on the profile (/{handle}/), the highlight bubbles sit
+   in a horizontal row just under the header. Open EACH highlight (left to right,
+   max 10 highlights). For each one, capture:
+     - title (the label under the bubble)
+     - cover_text (any text visible on the bubble itself before opening)
+     - slides (1-2 sentences of text from each slide inside — caption overlays,
+       location stamps, song titles, sticker text, mentions)
+   Close the highlight viewer (X or click outside) before opening the next one.
+   STORY HIGHLIGHTS ARE HIGH SIGNAL — they're the curated story of who you are.
+
+7. FOLLOWING — back on the profile, click the "X following" number to open the
+   modal. Capture the FIRST 30 accounts visible (top of list = most recent / pinned).
+   For each: handle (without @) and display_name. Scroll the modal once if needed
+   to get the first 30. Close the modal (X) when done.
 
 {GLOBAL_RULES}
 {OUTPUT_SCHEMA}
@@ -172,6 +204,23 @@ Otherwise collect (in order):
 
 4. TAGGED — /{handle}/tagged/, URL paths of the 10 most recent. URLs only.
 
+5. STORY HIGHLIGHTS — back on the profile (/{handle}/), the highlight bubbles sit
+   in a horizontal row just under the header. Open EACH highlight (left to right,
+   max 10 highlights). For each: title (label under bubble), cover_text (text on
+   the bubble cover), slides (1-2 sentences of caption / overlay text per slide).
+   Close the viewer before opening the next one.
+   STORY HIGHLIGHTS ARE HIGH SIGNAL — curated identity, way more honest than the grid.
+
+6. FOLLOWING — back on the profile, click the "X following" number to open the
+   modal. Capture the FIRST 30 visible accounts. For each: handle, display_name.
+   Scroll once if needed. Close the modal (X).
+
+7. MUTUALS — also on the profile, look for the section that says
+   "Followed by @X, @Y and N others you follow" (or similar). Click "and N others"
+   if it expands, capture the ALL the handles + display names that section reveals.
+   This is the cross-graph signal — the SINGLE most important thing here.
+   If no such section appears, leave mutuals empty.
+
 DO NOT touch the saved tab (you can't see someone else's saved).
 
 {GLOBAL_RULES}
@@ -184,11 +233,11 @@ Set mode="target", handle="{handle}". Omit "saved" entirely.
 # ---------- agent runners ----------
 def _browser() -> Browser:
     # Persistent profile keeps the IG login between runs. Windowed so the demo
-    # audience can watch Claude work.
+    # audience can watch Claude work. Bundled chromium (no channel="chrome")
+    # avoids the single-instance collision with the user's normal Chrome.
     profile = BrowserProfile(
         user_data_dir=str(PROFILE_DIR),
         headless=False,
-        channel="chrome",
     )
     return Browser(browser_profile=profile)
 

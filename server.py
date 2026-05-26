@@ -47,6 +47,11 @@ class JobState:
     scrape: Optional[dict] = None
     readout: Optional[dict] = None
     error: Optional[str] = None
+    # For target jobs: which self-handle to use for compatibility, and the data
+    # collected if we had to scrape self first. self_scrape lives in memory only —
+    # it gets persisted under its own kind="self" job row by _scrape_worker.
+    self_handle: Optional[str] = None
+    self_scrape: Optional[dict] = None
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -117,27 +122,39 @@ async def db_load_job(job_id: str) -> Optional[dict]:
         }
 
 
-async def db_recent_self_readout(days: int = 30) -> Optional[dict]:
+async def db_recent_self_readout(days: int = 30, handle: Optional[str] = None) -> Optional[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            "SELECT readout_json FROM jobs WHERE kind = 'self' AND status = 'done' "
-            "AND created_at >= ? AND readout_json IS NOT NULL "
-            "ORDER BY created_at DESC LIMIT 1", (cutoff,))
+        if handle:
+            rows = await db.execute_fetchall(
+                "SELECT readout_json FROM jobs WHERE kind = 'self' AND status = 'done' "
+                "AND handle = ? AND created_at >= ? AND readout_json IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1", (handle, cutoff))
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT readout_json FROM jobs WHERE kind = 'self' AND status = 'done' "
+                "AND created_at >= ? AND readout_json IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1", (cutoff,))
         if not rows:
             return None
         return json.loads(rows[0]["readout_json"])
 
 
-async def db_recent_self_scrape(days: int = 30) -> Optional[dict]:
+async def db_recent_self_scrape(days: int = 30, handle: Optional[str] = None) -> Optional[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            "SELECT scrape_json FROM jobs WHERE kind = 'self' AND status = 'done' "
-            "AND scrape_json IS NOT NULL AND created_at >= ? "
-            "ORDER BY created_at DESC LIMIT 1", (cutoff,))
+        if handle:
+            rows = await db.execute_fetchall(
+                "SELECT scrape_json FROM jobs WHERE kind = 'self' AND status = 'done' "
+                "AND handle = ? AND scrape_json IS NOT NULL AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT 1", (handle, cutoff))
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT scrape_json FROM jobs WHERE kind = 'self' AND status = 'done' "
+                "AND scrape_json IS NOT NULL AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT 1", (cutoff,))
         if not rows:
             return None
         return json.loads(rows[0]["scrape_json"])
@@ -203,34 +220,69 @@ def _scrape_worker(job_id: str):
                     "thinking": thinking, "next_goal": next_goal})
 
     try:
-        job.status = "scraping"
-        _push(job, {"type": "status", "status": "scraping"})
+        # SELF MODE — one scrape, aura readout.
         if job.kind == "self":
+            job.status = "scraping"
+            _push(job, {"type": "status", "status": "scraping", "phase": "self"})
             data = agent_scrape.scrape_self(job.handle, narrate=narrate_cb)
-        else:
-            data = agent_scrape.scrape_target(job.handle, narrate=narrate_cb)
-        job.scrape = data
+            job.scrape = data
 
+            job.status = "analyzing"
+            _push(job, {"type": "status", "status": "analyzing"})
+            readout = analyze.aura(data)
+            job.readout = readout
+            job.status = "done"
+            if job.loop:
+                asyncio.run_coroutine_threadsafe(db_upsert_job(job), job.loop).result()
+            _push(job, {"type": "done", "readout": readout})
+            return
+
+        # TARGET MODE — compatibility flow.
+        # 1. Pull (or scrape) self data for the requested self_handle.
+        prior_self_scrape: Optional[dict] = None
+        prior_self_readout: Optional[dict] = None
+        if job.self_handle and job.loop:
+            fut = asyncio.run_coroutine_threadsafe(
+                _gather_prior_self(job.self_handle), job.loop)
+            prior_self_scrape, prior_self_readout = fut.result()
+
+        if job.self_handle and not prior_self_scrape:
+            # No cached self data — scrape self FIRST.
+            _push(job, {"type": "status", "status": "scraping", "phase": "self"})
+            _push(job, {"type": "narration", "step": 0,
+                        "thinking": f"No recent scrape on file for @{job.self_handle} — scraping you first so we can do a real compatibility read.",
+                        "next_goal": f"scrape @{job.self_handle}"})
+            self_data = agent_scrape.scrape_self(job.self_handle, narrate=narrate_cb)
+            job.self_scrape = self_data
+            # Persist the self scrape as its own job row so it shows up in history
+            # and future target runs can reuse it.
+            if job.loop:
+                self_job_id = uuid.uuid4().hex[:12]
+                self_job = JobState(job_id=self_job_id, kind="self", handle=job.self_handle,
+                                    status="done", scrape=self_data, created_at=_now_iso(),
+                                    loop=job.loop)
+                asyncio.run_coroutine_threadsafe(db_upsert_job(self_job), job.loop).result()
+            prior_self_scrape = self_data
+            prior_self_readout = None
+
+        # 2. Scrape target.
+        job.status = "scraping"
+        _push(job, {"type": "status", "status": "scraping", "phase": "target"})
+        target_data = agent_scrape.scrape_target(job.handle, narrate=narrate_cb)
+        job.scrape = target_data
+
+        # 3. Vibe analysis.
         job.status = "analyzing"
         _push(job, {"type": "status", "status": "analyzing"})
-
-        if job.kind == "self":
-            readout = analyze.aura(data)
-        else:
-            # try to pair with the most recent cached self readout (last 30d)
-            fut = asyncio.run_coroutine_threadsafe(
-                _gather_prior_self(), job.loop) if job.loop else None
-            prior_self_scrape, prior_self_readout = fut.result() if fut else (None, None)
-            self_for_vibe = prior_self_scrape or {
-                "handle": "unknown", "header": {}, "grid": [], "reels": []}
-            readout = analyze.vibe(self_for_vibe, data, self_aura=prior_self_readout)
-
+        self_for_vibe = prior_self_scrape or {
+            "handle": "unknown", "header": {}, "grid": [], "reels": [], "highlights": []}
+        readout = analyze.vibe(self_for_vibe, target_data, self_aura=prior_self_readout)
         job.readout = readout
         job.status = "done"
-        # persist
         if job.loop:
             asyncio.run_coroutine_threadsafe(db_upsert_job(job), job.loop).result()
         _push(job, {"type": "done", "readout": readout})
+
     except Exception as e:
         job.status = "error"
         job.error = f"{type(e).__name__}: {e}"
@@ -241,8 +293,8 @@ def _scrape_worker(job_id: str):
         _push(job, {"type": "__end__"})
 
 
-async def _gather_prior_self() -> tuple[Optional[dict], Optional[dict]]:
-    return await db_recent_self_scrape(), await db_recent_self_readout()
+async def _gather_prior_self(handle: Optional[str] = None) -> tuple[Optional[dict], Optional[dict]]:
+    return await db_recent_self_scrape(handle=handle), await db_recent_self_readout(handle=handle)
 
 
 # ---------- FastAPI app ----------
@@ -268,6 +320,10 @@ async def index():
 class ScrapeBody(BaseModel):
     kind: str
     handle: str
+    # For target jobs: your own handle. If provided and there's no recent self
+    # scrape for it, we run a self scrape first so the vibe analysis has
+    # something to compare against.
+    self_handle: Optional[str] = None
 
 
 @app.post("/scrape")
@@ -277,8 +333,10 @@ async def scrape(body: ScrapeBody, background: BackgroundTasks):
     handle = body.handle.strip().lstrip("@")
     if not handle:
         raise HTTPException(400, "empty handle")
+    self_handle = (body.self_handle or "").strip().lstrip("@") or None
     job_id = uuid.uuid4().hex[:12]
     job = JobState(job_id=job_id, kind=body.kind, handle=handle,
+                   self_handle=self_handle,
                    created_at=_now_iso(), loop=asyncio.get_event_loop())
     JOBS[job_id] = job
     await db_upsert_job(job)
@@ -484,8 +542,10 @@ def _open_login_window():
     profile_dir = str(agent_scrape.PROFILE_DIR)
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
     with sync_playwright() as pw:
+        # No channel="chrome" — Playwright's bundled chromium avoids the
+        # single-instance collision with the user's normal Chrome.
         ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=profile_dir, headless=False, channel="chrome",
+            user_data_dir=profile_dir, headless=False,
             viewport=None, args=["--start-maximized"],
         )
         page = ctx.new_page()
@@ -517,10 +577,13 @@ async def setup_connect():
 @app.get("/setup/check")
 async def setup_check():
     base = agent_scrape.PROFILE_DIR / "Default"
-    for name in ("Cookies", "Cookies-journal"):
-        p = base / name
-        if p.exists() and p.stat().st_size > 0:
-            return {"connected": True}
+    # Newer chromium stores cookies under Default/Network/. Older builds
+    # used Default/ directly. Check both.
+    for sub in (base, base / "Network"):
+        for name in ("Cookies", "Cookies-journal"):
+            p = sub / name
+            if p.exists() and p.stat().st_size > 0:
+                return {"connected": True}
     return {"connected": False}
 
 

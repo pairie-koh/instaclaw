@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from anthropic import Anthropic
 
-MODEL = "claude-opus-4-7"
+MODEL = "claude-sonnet-4-6"
 client = Anthropic()
 
 # Few-shot anchors used by both prompts to calibrate "specific" vs "generic".
@@ -33,9 +33,11 @@ SYSTEM_AURA = f"""You are the user's sharpest friend, writing them a readout aft
 {GOOD_VS_BAD}
 
 HARD RULES:
-- Every claim must point to specific evidence from the scrape: a caption, a comment, a particular Reel they reposted, an audio track, who tagged them. If you can't cite, don't claim.
+- Every claim must point to specific evidence from the scrape: a caption, a comment, a particular Reel they reposted, an audio track, who tagged them, a story highlight title or slide, an account in their following list. If you can't cite, don't claim.
 - The Reels tab — what they REPOST — is the highest-signal taste data. The "Taste cluster" section lives or dies on this.
-- Where data is thin (private surface, missing Reels, sparse comments), say so in calibration. Do not paper over with vibes.
+- Story highlights are the second highest signal: the curated identity the person *chooses* to pin. Highlight titles + slide overlays = explicit lore drops. Use them.
+- The Following list splits two ways: handles that look like IRL friends (small-account-feel, low recognition, normal names) tell you about their social graph; recognized public figures / influencers tell you about their interests. Read both signals — don't lump them together.
+- Where data is thin (private surface, missing Reels, sparse comments, no highlights, no following), say so in calibration. Do not paper over with vibes.
 - No horoscope language. No therapy-speak. No MBTI energy. No "main character" unless tied to a specific post.
 - Funny is allowed. Mean is not. Observational is the register.
 
@@ -66,7 +68,10 @@ Tone: friend-who-paid-attention, not stalkerware. Honest, useful, calibrated. Fu
 HARD RULES:
 - Every claim must cite specific evidence from the target's scrape.
 - The Reels they REPOST are the highest-signal taste data. The "Taste cluster" section depends on this.
-- "Likely single" is a PROBABILITY READ, not a verdict. Cite signals (recurring romantic-coded commenter, partner tags, joint accounts, "happy birthday baby" posts, anniversaries) AND state confidence.
+- Story highlights are the second-highest signal — what they chose to PIN forever. A "Bali 24" highlight, a "❤" highlight with the same person across slides, a "wins" highlight — these are deliberate self-presentation. Mine them for both compatibility read and "Likely single?".
+- The MUTUALS list (people the user follows who also follow the target) is the cross-graph signal — if it exists, it tells you exactly how the two are socially adjacent. Use it in "Social context" and "Mutual ground."
+- The target's FOLLOWING splits two ways: handles that look like IRL friends/normies (low recognition) reveal their actual social world; recognized influencers / brands / public figures reveal their interests. Treat them separately.
+- "Likely single" is a PROBABILITY READ, not a verdict. Cite signals (recurring romantic-coded commenter, partner tags, joint accounts, "happy birthday baby" posts, anniversaries, *a highlight dedicated to one person*, *following a partner-coded private-looking account daily*) AND state confidence.
 - Conversation openers must reference specific recent posts of theirs, with a draft line. No "ask about their travel" — instead "their post from Saturday with the goat — open with 'okay but the goat'".
 - Compatibility is an honest cross-fingerprint compare. Where you'd click AND where you'd grate. Flattery is useless to the user.
 - Yellow flags are funny observations, not warnings. "Every caption is a Drake lyric" is the tone. Not "may have commitment issues."
