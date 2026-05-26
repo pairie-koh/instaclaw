@@ -64,6 +64,8 @@ body { padding: 72px 24px; }
 .section { margin-top: 40px; padding-top: 28px; border-top: 1px solid var(--rule); }
 .section .label { margin-bottom: 16px; }
 .section .body { font-size: 15.5px; line-height: 1.62; }
+.section .body p + p { margin-top: 14px; }
+.section .body strong { color: var(--ink); font-weight: 600; }
 .calibration { margin-top: 44px; padding-top: 24px; border-top: 1px solid var(--rule);
   font-size: 14px; line-height: 1.55; }
 .foot { margin-top: 36px; }
@@ -84,6 +86,8 @@ body { background: var(--paper); }
 .story .section { padding-top: 28px; border-top: 1px solid var(--rule); }
 .story .label { font-size: 18px; margin-bottom: 18px; }
 .story .body { font-size: 28px; line-height: 1.45; }
+.story .body p + p { margin-top: 22px; }
+.story .body strong { color: var(--ink); font-weight: 600; }
 .story .body li { padding: 18px 0; grid-template-columns: 44px 1fr; }
 .story .body li::before { font-size: 18px; }
 .story .tail { margin-top: auto; }
@@ -95,11 +99,28 @@ body { background: var(--paper); }
 """
 
 
+import re as _re
+
+
+def _bold(s: str) -> str:
+    """Convert **text** to <strong>text</strong>. Runs on already-escaped HTML."""
+    return _re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+
+
 def _body_html(body) -> str:
     if isinstance(body, list):
-        items = "".join(f"<li><span>{html.escape(str(x))}</span></li>" for x in body)
+        items = "".join(f"<li><span>{_bold(html.escape(str(x)))}</span></li>" for x in body)
         return f"<ul>{items}</ul>"
-    return f"<p>{html.escape(str(body))}</p>"
+    # Honor line breaks. Double newline = new paragraph, single = soft break.
+    text = str(body)
+    paragraphs = text.split("\n\n")
+    rendered_paras = []
+    for para in paragraphs:
+        if not para.strip():
+            continue
+        escaped = "<br>".join(_bold(html.escape(line)) for line in para.split("\n"))
+        rendered_paras.append(f"<p>{escaped}</p>")
+    return "".join(rendered_paras) or "<p></p>"
 
 
 def _sections_html(sections) -> str:
@@ -133,7 +154,6 @@ def render(readout: dict, target_handle: str | None = None) -> str:
     <p class="subheadline">{html.escape(readout.get('subheadline',''))}</p>
   </header>
   {_sections_html(readout.get('sections', []))}
-  <p class="calibration">{html.escape(readout.get('calibration',''))}</p>
   {_foot(target_handle)}
 </article></body></html>"""
 
@@ -152,8 +172,7 @@ def render_story(readout: dict, target_handle: str | None = None) -> str:
   <p class="subheadline">{html.escape(readout.get('subheadline',''))}</p>
   <div class="sections">{_sections_html(readout.get('sections', []))}</div>
   <div class="tail">
-    <p class="calibration">{html.escape(readout.get('calibration',''))}</p>
-    {_foot(target_handle)}
+      {_foot(target_handle)}
   </div>
 </section></body></html>"""
 

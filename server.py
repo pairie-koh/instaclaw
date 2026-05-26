@@ -400,6 +400,9 @@ async def stream_job(job_id: str, request: Request):
 class ChatBody(BaseModel):
     job_id: str
     message: str
+    # Optional pronouns for the target and self — frontend can pass from settings.
+    target_pronouns: Optional[str] = None
+    self_pronouns: Optional[str] = None
 
 
 CHAT_TOOL = {
@@ -413,16 +416,21 @@ CHAT_TOOL = {
 }
 
 
-def _chat_system(job: dict) -> str:
+def _chat_system(job: dict, target_pronouns: Optional[str] = None,
+                 self_pronouns: Optional[str] = None) -> str:
     kind = job["kind"]
     handle = job["handle"]
     scrape = job.get("scrape") or {}
     readout = job.get("readout") or {}
+    tp = target_pronouns or "they/them"
+    sp = self_pronouns or "they/them"
     return f"""You are the user's sharpest friend, answering follow-up questions about
 @{handle}'s Instagram. You already wrote the readout below and have the full scrape.
 
 TARGET MODE: {kind}
 TARGET HANDLE: @{handle}
+TARGET PRONOUNS: {tp} — use these throughout.
+USER PRONOUNS: {sp}
 
 CACHED SCRAPE:
 ```json
@@ -435,12 +443,14 @@ PRIOR READOUT YOU WROTE:
 ```
 
 Rules:
-- Answer from the cached data when possible. Be specific — cite captions, comments, reels, audio.
+- Answer from the cached data when possible. Be specific, cite captions, comments, reels, audio.
 - If the answer truly requires fresh IG browsing (e.g. "who's that person in their stories",
   "what's @x's deal", "are they at the same event as @y"), call the `fetch_more` tool with a
   focused query. Don't call it for things you can already answer.
 - Tone matches the readout: observational, specific, faintly funny. Never mean.
 - Keep replies under ~200 words unless the user asks for more.
+- NEVER use em-dashes (—) or en-dashes (–). Use periods, commas, parentheses, colons, or line breaks instead.
+- Format the reply for legibility: use \\n\\n (double newline) for paragraph breaks, and **double asterisks** around the 2-3 key phrases you want bolded (the verdict line, a key @handle, a punchline). Each beat on its own paragraph, not a wall of prose.
 """
 
 
@@ -455,7 +465,8 @@ async def _chat_stream(body: ChatBody, request: Request):
         return
 
     handle = job_row["handle"]
-    system = _chat_system(job_row)
+    system = _chat_system(job_row, target_pronouns=body.target_pronouns,
+                          self_pronouns=body.self_pronouns)
 
     # Build messages: prior conversation + this user message
     history = await db_load_chat(body.job_id)

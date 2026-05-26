@@ -144,9 +144,14 @@ html, body { background: var(--paper); color: var(--ink); font-family: var(--san
 .trace-evidence .evidence-label { font-family: var(--mono); font-size: 9.5px;
   letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent);
   display: block; margin-bottom: 6px; }
-.reply { font-family: var(--serif); font-weight: 400; font-size: 19px;
-  line-height: 1.55; color: var(--ink); font-variation-settings: 'opsz' 36;
-  margin-top: 18px; }
+.reply { font-family: var(--sans); font-size: 15px;
+  line-height: 1.62; color: var(--ink);
+  margin-top: 22px; padding: 20px 22px;
+  background: rgba(255,255,255,0.025); border: 1px solid var(--rule);
+  border-radius: 4px; }
+.reply p { margin: 0; }
+.reply p + p { margin-top: 12px; }
+.reply strong { color: #fff; font-weight: 600; }
 
 /* history drawer */
 .scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 40;
@@ -378,6 +383,23 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Render a chat reply: escape HTML, then expand **bold** and turn \n\n into paragraphs.
+function formatReply(text) {
+  const paras = String(text).split(/\n\s*\n/);
+  return paras
+    .map(p => p.trim())
+    .filter(Boolean)
+    .map(p => {
+      const lines = p.split('\n').map(line => {
+        let safe = escapeHtml(line);
+        safe = safe.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        return safe;
+      });
+      return '<p>' + lines.join('<br>') + '</p>';
+    })
+    .join('');
+}
+
 // ───────── iframe auto-resize ─────────
 function fitFrame() {
   try {
@@ -552,7 +574,11 @@ async function sendChat() {
     resp = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-      body: JSON.stringify({ job_id: state.jobId, message: msg }),
+      body: JSON.stringify({
+        job_id: state.jobId, message: msg,
+        target_pronouns: localStorage.getItem('instaclaw_target_pronouns') || 'he/him',
+        self_pronouns:   localStorage.getItem('instaclaw_self_pronouns')   || 'she/her',
+      }),
       signal: state.chatAbort.signal,
     });
   } catch (e) {
@@ -644,7 +670,7 @@ function renderChatEvent(turn, trace, ev) {
     case 'message': {
       const reply = document.createElement('div');
       reply.className = 'reply';
-      reply.textContent = ev.content || ev.text || ev.message || '';
+      reply.innerHTML = formatReply(ev.content || ev.text || ev.message || '');
       turn.appendChild(reply);
       break;
     }

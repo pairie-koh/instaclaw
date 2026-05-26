@@ -272,41 +272,45 @@ HARD RULES (apply to every step):
 def _self_task(handle: str) -> str:
     return f"""You are scraping the Instagram account @{handle} (the logged-in user's own account).
 
-Go to https://www.instagram.com/{handle}/ — then collect surfaces in THIS ORDER:
+Go to https://www.instagram.com/{handle}/ — collect THREE surfaces, in this order:
 
-**STEP 1 (CRITICAL): REELS TAB — the dating-recon signal lives here.**
-Navigate to /{handle}/reels/. Open EACH reel (up to 10 most recent, left-to-right).
-For each reel: URL path, caption, creator handle (your own @{handle} for original
-posts, the ORIGINAL POSTER's @handle for REPOSTS — distinguishing reposts is the
-single most important thing in this task), and the audio track name.
-Call **save_reel** after each one.
+**STEP 1: REPOSTS TAB — THE MAIN EVENT. THIS IS NOT THE REELS TAB.**
+On an Instagram profile there is a row of tab icons under the bio: Posts (grid),
+Reels (play-arrow), REPOSTS (circular-arrows / repost icon), Tagged.
+The REPOSTS tab is where things the user has reposted from OTHER creators live.
+This is what we need — what they share/boost is the highest-signal taste data.
+
+Click the REPOSTS tab on /{handle}/. It's distinct from the Reels tab and from
+the grid. If you can't find a Reposts tab on the profile, try the Reels tab
+INSTEAD as a fallback (some accounts route reposts through Reels).
+
+**TARGET: 20 reposts minimum, 30 max** — collect AT LEAST 20 if they exist;
+stop at 30. Scroll to load more if the visible set is smaller. Only stop short
+of 20 if the tab genuinely has fewer items.
+
+Per repost: URL path, caption, creator (the ORIGINAL POSTER's @handle, not
+@{handle} — distinguishing the original creator is the whole point), audio
+track name.
+Call **save_reel** after each one. Save as you go.
 
 **STEP 2: STORY HIGHLIGHTS — pinned identity.**
-Back on /{handle}/. The highlight bubbles sit in a row under the header. Open
-EACH (up to 8). For each highlight: title (label under bubble), cover_text (text
-visible on the bubble), and a short string for each slide (caption overlay,
-location stamp, song title, sticker text — 1 sentence per slide max).
-Call **save_highlight** after closing each one.
+Back on /{handle}/. Open up to 5 highlight bubbles, left to right. Per bubble:
+title, cover_text, one short string per slide (caption / location / audio / sticker).
+Call **save_highlight** after closing each.
 
 **STEP 3: PROFILE HEADER.**
-Back on /{handle}/. Read the display name, full bio text (including links), and
-the three stat numbers (posts / followers / following).
+Display name, bio (with links), stats (posts/followers/following).
 Call **save_header** once.
 
-**STEP 4 (OPTIONAL — only if STEPS 1-3 went smoothly): GRID POSTS.**
-Open up to 5 most recent grid posts. For each: URL, caption, ~5 top comments, likes.
+**STEP 4: GRID POSTS — what they actually broadcast.**
+Up to 5 most recent grid posts. Per post: URL, caption, ~5 top comments, likes.
 Call **save_grid_post** after each.
 
-**STEP 5 (OPTIONAL — final, skip if anything above is slow): SAVED + TAGGED URLs.**
-At /{handle}/saved/all-posts/ collect up to 10 URLs (call save_saved each).
-At /{handle}/tagged/ collect up to 5 URLs (call save_tagged each).
-
-DO NOT touch the Following modal — skip it for self mode.
+Don't touch saved, tagged, or Following — those aren't needed.
 
 {GLOBAL_RULES}
 
-When you've done everything you can — or you've hit step 25 — you can finish.
-Everything is already saved to disk via the save_* calls; the loop ending is fine.
+Finish when done or by step 50. Everything is on disk via save_* calls.
 """
 
 
@@ -322,37 +326,37 @@ with whatever header data is visible, and STOP. Don't try to bypass.
 
 Otherwise collect surfaces in THIS ORDER:
 
-**STEP 1 (CRITICAL): REELS TAB — the dating-recon signal lives here.**
-/{handle}/reels/. Open EACH reel (up to 10 most recent). For each: URL,
-caption, creator (the original poster for reposts — REPOSTS ARE THE SINGLE
-HIGHEST-SIGNAL THING), audio track name.
-Call **save_reel** after each.
+**STEP 1 (CRITICAL): REPOSTS TAB — the main event. NOT the Reels tab.**
+On the profile, find the row of tab icons: Posts, Reels, REPOSTS (circular-arrows
+icon), Tagged. Click the REPOSTS tab. That's what they've boosted from other
+creators — highest-signal taste data.
 
-**STEP 2: MUTUALS — cross-graph signal.**
-Back on /{handle}/. Look for the "Followed by @X, @Y and N others you follow"
-line. If it says "and N others", click to expand. Capture EVERY handle +
-display_name in that section.
-Call **save_mutual** for each.
+If a Reposts tab is not visible (smaller/older accounts), fall back to the Reels
+tab.
 
-**STEP 3: STORY HIGHLIGHTS — pinned identity.**
-Highlight bubbles under the header. Open EACH (up to 8). Per highlight: title,
-cover_text, slides (1 line per slide).
+**TARGET: 20 reposts minimum, 30 max** — at least 20 if they exist, stop at 30.
+Scroll to load more.
+
+Per repost: URL, caption, creator (the ORIGINAL POSTER's @handle), audio track.
+Call **save_reel** after each. Save as you go.
+
+**STEP 2: STORY HIGHLIGHTS — pinned identity.**
+Up to 5 highlight bubbles. Per bubble: title, cover_text, one short string per
+slide (caption / location / audio / sticker).
 Call **save_highlight** after closing each.
 
-**STEP 4: PROFILE HEADER.**
-Display name, bio, stats (posts / followers / following).
-Call **save_header** once.
+**STEP 3: PROFILE HEADER.**
+Display name, bio, stats. Call **save_header** once.
 
-**STEP 5 (OPTIONAL — only if STEPS 1-4 went smoothly): GRID POSTS.**
-Open up to 5 most recent grid posts. URL, caption, ~5 top comments, likes.
+**STEP 4: GRID POSTS — what they actually broadcast.**
+Up to 5 most recent grid posts. Per post: URL, caption, ~5 top comments, likes.
 Call **save_grid_post** after each.
 
-DO NOT touch following / tagged / saved tabs.
+Don't touch mutuals, tagged, saved, or Following — keep it tight.
 
 {GLOBAL_RULES}
 
-When you've done everything you can — or you've hit step 25 — you can finish.
-Everything is already saved to disk via the save_* calls.
+Finish when done or by step 50. Everything is on disk via save_* calls.
 """
 
 
