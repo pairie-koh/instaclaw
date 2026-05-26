@@ -1,7 +1,12 @@
-"""Browser-use powered Instagram scraper. Claude drives Playwright by looking at screenshots.
+"""Browser-use powered Instagram scraper with incremental checkpointing.
 
-Same output schema as scrape.py — analyze.py keeps working unchanged.
-Keys: mode, handle, header, grid, reels, tagged, saved (self only), private (target only).
+Reels-first task order: reposts are the #1 dating-recon signal so we collect those
+before anything else. Each piece of data the agent extracts is written to disk
+through a custom save_* action — so if browser-use terminates from LLM timeouts
+or repeated failures, the partial file on disk still has everything collected so
+far. Nothing is lost on crash.
+
+Same output schema as before — analyze.py / main.py / server.py keep working.
 """
 import asyncio
 import json
@@ -10,7 +15,7 @@ from typing import Callable, Optional
 
 from pydantic import BaseModel, Field
 
-from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic
+from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic, Controller
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.agent.views import AgentOutput
 
@@ -22,9 +27,13 @@ PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
 MODEL = "claude-sonnet-4-6"
+# Long timeout — context bloats heavily by step 40+ when the agent has collected
+# a lot of data. 90s default was too tight; 180s gives Sonnet room.
+LLM_TIMEOUT_S = 180
+MAX_FAILURES = 10
 
 
-# ---------- output schema (agent returns this verbatim via structured output) ----------
+# ---------- output schema (kept for type compatibility — partial files match this) ----------
 class Header(BaseModel):
     name: str = ""
     header_text: str = ""
@@ -50,9 +59,9 @@ class UrlOnly(BaseModel):
 
 
 class Highlight(BaseModel):
-    title: str = ""           # e.g. "Bali 24", "❤", "fits"
-    cover_text: str = ""      # any text visible on the cover bubble
-    slides: list[str] = Field(default_factory=list)  # text/captions seen inside the highlight reel
+    title: str = ""
+    cover_text: str = ""
+    slides: list[str] = Field(default_factory=list)
 
 
 class Follow(BaseModel):
@@ -69,12 +78,77 @@ class ScrapeResult(BaseModel):
     reels: list[Reel] = Field(default_factory=list)
     tagged: list[UrlOnly] = Field(default_factory=list)
     highlights: list[Highlight] = Field(default_factory=list)
-    following: list[Follow] = Field(default_factory=list)  # who they follow
-    mutuals: list[Follow] = Field(default_factory=list)    # target mode: "Followers you follow"
+    following: list[Follow] = Field(default_factory=list)
+    mutuals: list[Follow] = Field(default_factory=list)
     saved: Optional[list[UrlOnly]] = None
 
 
-# ---------- narration callback: prints Claude's thinking to terminal during the demo ----------
+# ---------- checkpoint store (writes after every save_*) ----------
+class CheckpointStore:
+    """Holds the in-progress scrape result and flushes to disk on every change.
+
+    The agent calls save_* actions throughout the scrape. Each call mutates the
+    store and immediately flushes. If browser-use terminates the agent for any
+    reason (timeouts, max failures, exception), the file already contains
+    everything collected up to that moment.
+    """
+    def __init__(self, path: Path, mode: str, handle: str):
+        self.path = path
+        self.state: dict = {
+            "mode": mode, "handle": handle, "private": False,
+            "header": {"name": "", "header_text": "", "stats_raw": []},
+            "grid": [], "reels": [], "tagged": [],
+            "highlights": [], "following": [], "mutuals": [],
+        }
+        if mode == "self":
+            self.state["saved"] = []
+        self._flush()
+
+    def _flush(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def set_header(self, name: str, header_text: str, stats_raw: list[str]):
+        self.state["header"] = {"name": name, "header_text": header_text, "stats_raw": stats_raw}
+        self._flush()
+
+    def mark_private(self):
+        self.state["private"] = True
+        self._flush()
+
+    def add_reel(self, url: str, caption: str, creator: str, audio: str):
+        self.state["reels"].append({"url": url, "caption": caption, "creator": creator, "audio": audio})
+        self._flush()
+
+    def add_highlight(self, title: str, cover_text: str, slides: list[str]):
+        self.state["highlights"].append({"title": title, "cover_text": cover_text, "slides": list(slides)})
+        self._flush()
+
+    def add_grid_post(self, url: str, caption: str, comments: list[str], likes_raw: str):
+        self.state["grid"].append({"url": url, "caption": caption, "comments": list(comments), "likes_raw": likes_raw})
+        self._flush()
+
+    def add_tagged(self, url: str):
+        self.state["tagged"].append({"url": url})
+        self._flush()
+
+    def add_saved(self, url: str):
+        self.state.setdefault("saved", []).append({"url": url})
+        self._flush()
+
+    def add_following(self, handle: str, display_name: str):
+        self.state["following"].append({"handle": handle, "display_name": display_name})
+        self._flush()
+
+    def add_mutual(self, handle: str, display_name: str):
+        self.state["mutuals"].append({"handle": handle, "display_name": display_name})
+        self._flush()
+
+    def snapshot(self) -> dict:
+        return dict(self.state)
+
+
+# ---------- narration callback ----------
 def _narrate(state: BrowserStateSummary, output: AgentOutput, step: int) -> None:
     cs = output.current_state
     if cs.thinking:
@@ -84,7 +158,6 @@ def _narrate(state: BrowserStateSummary, output: AgentOutput, step: int) -> None
 
 
 def _make_callback(extra: NarrateCb):
-    """Wrap stdout _narrate + an optional (step, thinking, next_goal) callback."""
     def cb(state: BrowserStateSummary, output: AgentOutput, step: int) -> None:
         _narrate(state, output, step)
         if extra is not None:
@@ -96,145 +169,197 @@ def _make_callback(extra: NarrateCb):
     return cb
 
 
-# ---------- shared task prompt fragments ----------
+# ---------- controller with incremental-save actions ----------
+def _make_controller(store: CheckpointStore) -> Controller:
+    """Register save_* actions that the agent calls as it collects each piece of data.
+
+    Each action immediately flushes to disk so the partial file is always current.
+    The agent is told (in the task prompt) to call these as it goes, not at the end.
+    """
+    controller = Controller()
+
+    @controller.action(
+        "Save the profile header. Call this once, right after extracting name/bio/stats."
+    )
+    async def save_header(name: str, header_text: str, stats_raw: list[str]) -> str:
+        store.set_header(name, header_text, stats_raw)
+        return f"header saved: name={name!r}"
+
+    @controller.action(
+        "Mark this target account as PRIVATE. Call this if the profile shows "
+        "'This Account is Private' or 'This profile is private' and you cannot see content."
+    )
+    async def mark_private() -> str:
+        store.mark_private()
+        return "marked private"
+
+    @controller.action(
+        "Save one reel from the Reels tab. Call this AFTER opening and reading the reel — "
+        "URL path like '/reel/ABC/', caption text, creator (especially the original poster's "
+        "@handle for REPOSTS), and the audio track name shown at the bottom."
+    )
+    async def save_reel(url: str, caption: str, creator: str, audio: str) -> str:
+        store.add_reel(url, caption, creator, audio)
+        return f"reel #{len(store.state['reels'])} saved: {url}"
+
+    @controller.action(
+        "Save one story highlight bubble. Call this after clicking through all its slides. "
+        "Provide: title (label under the bubble, e.g. 'travel'), cover_text (any text on the "
+        "bubble before opening), and slides (one short string per slide — caption overlays, "
+        "location stamps, audio track names, sticker text)."
+    )
+    async def save_highlight(title: str, cover_text: str, slides: list[str]) -> str:
+        store.add_highlight(title, cover_text, slides)
+        return f"highlight #{len(store.state['highlights'])} saved: {title!r} ({len(slides)} slides)"
+
+    @controller.action(
+        "Save one grid post. Call this after opening the post and reading caption + top comments + likes."
+    )
+    async def save_grid_post(url: str, caption: str, comments: list[str], likes_raw: str) -> str:
+        store.add_grid_post(url, caption, comments, likes_raw)
+        return f"grid post #{len(store.state['grid'])} saved: {url}"
+
+    @controller.action(
+        "Save one mutual follower (a person on 'Followed by ... others you follow'). "
+        "TARGET MODE ONLY. handle without @, display_name as shown."
+    )
+    async def save_mutual(handle: str, display_name: str) -> str:
+        store.add_mutual(handle, display_name)
+        return f"mutual #{len(store.state['mutuals'])} saved: @{handle}"
+
+    @controller.action(
+        "Save one tagged post URL (just the URL path, no captions needed)."
+    )
+    async def save_tagged(url: str) -> str:
+        store.add_tagged(url)
+        return f"tagged #{len(store.state['tagged'])} saved"
+
+    @controller.action(
+        "Save one saved post URL. SELF MODE ONLY. Just the URL path."
+    )
+    async def save_saved(url: str) -> str:
+        store.add_saved(url)
+        return f"saved #{len(store.state.get('saved') or [])} saved"
+
+    @controller.action(
+        "Save one account from the Following modal. handle without @, display_name as shown."
+    )
+    async def save_following(handle: str, display_name: str) -> str:
+        store.add_following(handle, display_name)
+        return f"following #{len(store.state['following'])} saved: @{handle}"
+
+    return controller
+
+
+# ---------- task prompts (REELS FIRST) ----------
 GLOBAL_RULES = """
 HARD RULES (apply to every step):
 - IGNORE the Explore feed, "Suggested Posts", "Suggested for you", and any popup or
   banner that says "Open in app", "See notifications", "Turn on notifications",
   "Log in to see more", or asks to save login info. Dismiss them and keep going.
-- Do NOT click on stories, ads, or sidebars. Stay on the profile / reels / tagged /
-  saved surfaces only.
-- If a surface fails to load after 2 attempts, SKIP it and return the partial data
-  for everything else you DID collect. Never crash. Never return nothing.
-- "Most recent" means top-left of the grid, top of the reels tab, etc. Collect in
-  visible order — do not reorder.
-- For URLs, use the path form like "/p/ABC123/" or "/reel/XYZ/" (no domain).
-"""
-
-OUTPUT_SCHEMA = """
-Return your final result as JSON matching this exact shape:
-{
-  "mode": "self" | "target",
-  "handle": "<the handle string>",
-  "private": false,                       // true ONLY for private target accounts
-  "header": {
-    "name":  "<display name>",
-    "header_text": "<full bio text incl. links>",
-    "stats_raw": ["<posts count>", "<followers>", "<following>"]
-  },
-  "grid":   [ {"url": "/p/.../", "caption": "...", "comments": ["...", ...], "likes_raw": "..."} ],
-  "reels":  [ {"url": "/reel/.../", "caption": "...", "creator": "<@handle of original poster>", "audio": "<audio track name>"} ],
-  "tagged": [ {"url": "/p/.../"} ],
-  "highlights": [ {"title": "<bubble title>", "cover_text": "<text on cover>", "slides": ["<caption / overlay text seen inside>", "..."]} ],
-  "following": [ {"handle": "@example", "display_name": "..."} ],
-  "mutuals":   [ {"handle": "@example", "display_name": "..."} ],   // TARGET mode only — "Followers you follow"
-  "saved":     [ {"url": "/p/.../"} ]                                // SELF mode only — omit for target
-}
+- Do NOT click on stories, ads, or sidebars. Stay on the profile / reels / tagged
+  surfaces only.
+- If a surface fails to load after 2 attempts, SKIP it and move on. Never get stuck.
+- "Most recent" means top-left of the grid, top of the reels tab, etc.
+- URLs in path form: "/p/ABC123/" or "/reel/XYZ/" (no domain).
+- CHECKPOINT EVERYTHING. Call the save_* action immediately after extracting each
+  piece of data. Do not batch — save_header right after reading the header, save_reel
+  right after each reel, save_highlight right after closing each highlight. If the
+  loop dies, only the data you saved is preserved.
 """
 
 
 def _self_task(handle: str) -> str:
     return f"""You are scraping the Instagram account @{handle} (the logged-in user's own account).
 
-Go to https://www.instagram.com/{handle}/ and collect the following surfaces, in order:
+Go to https://www.instagram.com/{handle}/ — then collect surfaces in THIS ORDER:
 
-1. PROFILE HEADER — display name, full bio text, and the three stat numbers
-   (posts / followers / following) as they appear on the page.
+**STEP 1 (CRITICAL): REELS TAB — the dating-recon signal lives here.**
+Navigate to /{handle}/reels/. Open EACH reel (up to 10 most recent, left-to-right).
+For each reel: URL path, caption, creator handle (your own @{handle} for original
+posts, the ORIGINAL POSTER's @handle for REPOSTS — distinguishing reposts is the
+single most important thing in this task), and the audio track name.
+Call **save_reel** after each one.
 
-2. GRID — open each of the 15 MOST RECENT posts (top-left to right, row by row).
-   For each post: URL path, caption, and the ~10 TOP comments visible (first ones
-   shown when you open the post). Also grab the likes string if shown.
+**STEP 2: STORY HIGHLIGHTS — pinned identity.**
+Back on /{handle}/. The highlight bubbles sit in a row under the header. Open
+EACH (up to 8). For each highlight: title (label under bubble), cover_text (text
+visible on the bubble), and a short string for each slide (caption overlay,
+location stamp, song title, sticker text — 1 sentence per slide max).
+Call **save_highlight** after closing each one.
 
-3. REELS TAB — go to /{handle}/reels/ and open each of the 20 MOST RECENT reels.
-   *** REPOSTED REELS ARE THE HIGHEST-PRIORITY SIGNAL — DO NOT SKIP THEM. ***
-   A repost shows another creator's handle at the top instead of @{handle}.
-   For each reel capture: URL path, caption, creator handle (theirs OR the original
-   poster for reposts), and the audio track name shown at the bottom.
+**STEP 3: PROFILE HEADER.**
+Back on /{handle}/. Read the display name, full bio text (including links), and
+the three stat numbers (posts / followers / following).
+Call **save_header** once.
 
-4. TAGGED — go to /{handle}/tagged/ and collect the URL paths of the 10 most
-   recent posts. URLs only, no need to open them.
+**STEP 4 (OPTIONAL — only if STEPS 1-3 went smoothly): GRID POSTS.**
+Open up to 5 most recent grid posts. For each: URL, caption, ~5 top comments, likes.
+Call **save_grid_post** after each.
 
-5. SAVED — go to /{handle}/saved/all-posts/ and collect the URL paths of the 20
-   most recently saved items. URLs only.
+**STEP 5 (OPTIONAL — final, skip if anything above is slow): SAVED + TAGGED URLs.**
+At /{handle}/saved/all-posts/ collect up to 10 URLs (call save_saved each).
+At /{handle}/tagged/ collect up to 5 URLs (call save_tagged each).
 
-6. STORY HIGHLIGHTS — back on the profile (/{handle}/), the highlight bubbles sit
-   in a horizontal row just under the header. Open EACH highlight (left to right,
-   max 10 highlights). For each one, capture:
-     - title (the label under the bubble)
-     - cover_text (any text visible on the bubble itself before opening)
-     - slides (1-2 sentences of text from each slide inside — caption overlays,
-       location stamps, song titles, sticker text, mentions)
-   Close the highlight viewer (X or click outside) before opening the next one.
-   STORY HIGHLIGHTS ARE HIGH SIGNAL — they're the curated story of who you are.
-
-7. FOLLOWING — back on the profile, click the "X following" number to open the
-   modal. Capture the FIRST 30 accounts visible (top of list = most recent / pinned).
-   For each: handle (without @) and display_name. Scroll the modal once if needed
-   to get the first 30. Close the modal (X) when done.
+DO NOT touch the Following modal — skip it for self mode.
 
 {GLOBAL_RULES}
-{OUTPUT_SCHEMA}
 
-Set mode="self", handle="{handle}", private=false. Saved must be populated.
+When you've done everything you can — or you've hit step 25 — you can finish.
+Everything is already saved to disk via the save_* calls; the loop ending is fine.
 """
 
 
 def _target_task(handle: str) -> str:
-    return f"""You are scraping the PUBLIC Instagram account @{handle} (someone else — not the
-logged-in user). You may be logged in, but treat this as public-only data.
+    return f"""You are scraping the Instagram account @{handle} (someone else — vibe check for the user).
 
 Go to https://www.instagram.com/{handle}/.
 
-FIRST: check if the account is private. If you see "This Account is Private" or
-"This account is private. Follow to see their photos and videos." then STOP
-after capturing the profile header and return:
-  {{ "mode": "target", "handle": "{handle}", "private": true, "header": {{...}} }}
+**FIRST: privacy gate.**
+If you see "This Account is Private" or "This profile is private" and there is NO
+visible content beyond the header, call **mark_private**, then call **save_header**
+with whatever header data is visible, and STOP. Don't try to bypass.
 
-Otherwise collect (in order):
+Otherwise collect surfaces in THIS ORDER:
 
-1. PROFILE HEADER — display name, full bio, posts/followers/following stats.
+**STEP 1 (CRITICAL): REELS TAB — the dating-recon signal lives here.**
+/{handle}/reels/. Open EACH reel (up to 10 most recent). For each: URL,
+caption, creator (the original poster for reposts — REPOSTS ARE THE SINGLE
+HIGHEST-SIGNAL THING), audio track name.
+Call **save_reel** after each.
 
-2. GRID — open each of the 15 MOST RECENT posts (top-left, row by row).
-   Capture URL, caption, ~10 top comments, likes string.
+**STEP 2: MUTUALS — cross-graph signal.**
+Back on /{handle}/. Look for the "Followed by @X, @Y and N others you follow"
+line. If it says "and N others", click to expand. Capture EVERY handle +
+display_name in that section.
+Call **save_mutual** for each.
 
-3. REELS TAB — /{handle}/reels/, open the 20 MOST RECENT reels.
-   *** REPOSTED REELS ARE THE HIGHEST-PRIORITY SIGNAL — DO NOT SKIP THEM. ***
-   A repost shows another creator at the top instead of @{handle}.
-   Per reel: URL, caption, creator handle, audio track name.
+**STEP 3: STORY HIGHLIGHTS — pinned identity.**
+Highlight bubbles under the header. Open EACH (up to 8). Per highlight: title,
+cover_text, slides (1 line per slide).
+Call **save_highlight** after closing each.
 
-4. TAGGED — /{handle}/tagged/, URL paths of the 10 most recent. URLs only.
+**STEP 4: PROFILE HEADER.**
+Display name, bio, stats (posts / followers / following).
+Call **save_header** once.
 
-5. STORY HIGHLIGHTS — back on the profile (/{handle}/), the highlight bubbles sit
-   in a horizontal row just under the header. Open EACH highlight (left to right,
-   max 10 highlights). For each: title (label under bubble), cover_text (text on
-   the bubble cover), slides (1-2 sentences of caption / overlay text per slide).
-   Close the viewer before opening the next one.
-   STORY HIGHLIGHTS ARE HIGH SIGNAL — curated identity, way more honest than the grid.
+**STEP 5 (OPTIONAL — only if STEPS 1-4 went smoothly): GRID POSTS.**
+Open up to 5 most recent grid posts. URL, caption, ~5 top comments, likes.
+Call **save_grid_post** after each.
 
-6. FOLLOWING — back on the profile, click the "X following" number to open the
-   modal. Capture the FIRST 30 visible accounts. For each: handle, display_name.
-   Scroll once if needed. Close the modal (X).
-
-7. MUTUALS — also on the profile, look for the section that says
-   "Followed by @X, @Y and N others you follow" (or similar). Click "and N others"
-   if it expands, capture the ALL the handles + display names that section reveals.
-   This is the cross-graph signal — the SINGLE most important thing here.
-   If no such section appears, leave mutuals empty.
-
-DO NOT touch the saved tab (you can't see someone else's saved).
+DO NOT touch following / tagged / saved tabs.
 
 {GLOBAL_RULES}
-{OUTPUT_SCHEMA}
 
-Set mode="target", handle="{handle}". Omit "saved" entirely.
+When you've done everything you can — or you've hit step 25 — you can finish.
+Everything is already saved to disk via the save_* calls.
 """
 
 
 # ---------- agent runners ----------
 def _browser() -> Browser:
-    # Persistent profile keeps the IG login between runs. Windowed so the demo
-    # audience can watch Claude work. Bundled chromium (no channel="chrome")
-    # avoids the single-instance collision with the user's normal Chrome.
+    # Bundled chromium (no channel="chrome") avoids single-instance collision
+    # with the user's normal Chrome.
     profile = BrowserProfile(
         user_data_dir=str(PROFILE_DIR),
         headless=False,
@@ -242,47 +367,36 @@ def _browser() -> Browser:
     return Browser(browser_profile=profile)
 
 
-def _to_dict(result: ScrapeResult, mode: str, handle: str) -> dict:
-    d = result.model_dump()
-    d["mode"] = mode
-    d["handle"] = handle
-    if mode == "target":
-        d.pop("saved", None)
-    if mode == "self" and d.get("saved") is None:
-        d["saved"] = []
-    return d
-
-
 async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
+    out_path = OUT_DIR / f"{mode}_{handle}.json"
+    store = CheckpointStore(out_path, mode, handle)
     browser = _browser()
-    llm = ChatAnthropic(model=MODEL)
+    llm = ChatAnthropic(model=MODEL, timeout=LLM_TIMEOUT_S)
+    controller = _make_controller(store)
     agent = Agent(
         task=task,
         llm=llm,
         browser=browser,
-        output_model_schema=ScrapeResult,
+        controller=controller,
         register_new_step_callback=_make_callback(narrate),
         max_actions_per_step=5,
+        max_failures=MAX_FAILURES,
         use_vision=True,
     )
-    history = await agent.run()
-    result: Optional[ScrapeResult] = history.structured_output
-    if result is None:
-        # graceful partial: fall back to whatever the agent put in final_result text
-        raw = history.final_result() or "{}"
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            payload = {}
-        payload.setdefault("mode", mode)
-        payload.setdefault("handle", handle)
-        return payload
-    return _to_dict(result, mode, handle)
+    try:
+        await agent.run()
+    except Exception as e:
+        print(f">>> agent.run() raised {type(e).__name__}: {e}")
+    # Whatever happened, the file on disk has everything that got checkpointed.
+    return json.loads(out_path.read_text(encoding="utf-8"))
 
 
 def _write(data: dict, mode: str, handle: str) -> dict:
+    # The checkpoint store already wrote the file. This is just for the log line
+    # and to return the canonical dict.
     out_path = OUT_DIR / f"{mode}_{handle}.json"
-    out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not out_path.exists():
+        out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {out_path}")
     return data
 
@@ -318,13 +432,14 @@ If you couldn't find an answer, say so plainly and describe what you did look at
 Keep it under ~400 words. No speculation beyond what's visible.
 """
     browser = _browser()
-    llm = ChatAnthropic(model=MODEL)
+    llm = ChatAnthropic(model=MODEL, timeout=LLM_TIMEOUT_S)
     agent = Agent(
         task=task,
         llm=llm,
         browser=browser,
         register_new_step_callback=_make_callback(narrate),
         max_actions_per_step=5,
+        max_failures=MAX_FAILURES,
         use_vision=True,
     )
     history = await agent.run()
