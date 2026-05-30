@@ -4,29 +4,47 @@ cd /d "%~dp0"
 
 echo === instaclaw setup ===
 
-REM Check Python is installed
+REM --- Python check ---
 python --version >nul 2>&1
 if errorlevel 1 (
     echo.
     echo ERROR: Python is not installed or not on PATH.
-    echo Please install Python 3.10+ from https://python.org/downloads
-    echo During install, check "Add Python to PATH".
+    echo Install Python 3.10+ from https://python.org/downloads ^(check "Add Python to PATH"^).
     echo.
     pause
     exit /b 1
 )
 
-REM Check Python version >= 3.10 (uses python itself for portability)
 python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"
 if errorlevel 1 (
-    echo.
-    echo ERROR: Python is older than 3.10. Install a newer Python from https://python.org/downloads
-    echo.
+    echo ERROR: Python ^< 3.10. Install a newer one from https://python.org/downloads
     pause
     exit /b 1
 )
 
-REM Create venv if missing
+REM --- WSL check (kuri only ships Linux binaries) ---
+wsl -l -v >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ERROR: WSL is not installed. instaclaw drives the browser through kuri,
+    echo which only ships Linux binaries.
+    echo.
+    echo Open an Administrator PowerShell and run:
+    echo     wsl --install -d Ubuntu
+    echo Reboot, then re-run setup.bat.
+    pause
+    exit /b 1
+)
+
+wsl -d Ubuntu -- bash -c "true" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: WSL distro "Ubuntu" not found.
+    echo Run:   wsl --install -d Ubuntu
+    pause
+    exit /b 1
+)
+
+REM --- venv + python deps ---
 if not exist ".venv\Scripts\activate.bat" (
     echo Creating virtualenv at .venv ...
     python -m venv .venv
@@ -35,16 +53,9 @@ if not exist ".venv\Scripts\activate.bat" (
         pause
         exit /b 1
     )
-) else (
-    echo Virtualenv .venv already exists, reusing.
 )
-
 call .venv\Scripts\activate.bat
-
-echo Upgrading pip ...
 python -m pip install --upgrade pip
-
-echo Installing requirements ...
 pip install -r requirements.txt
 if errorlevel 1 (
     echo ERROR: pip install failed.
@@ -52,26 +63,57 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Installing playwright chromium ...
-playwright install chromium
+REM --- google-chrome inside WSL (for kuri-managed browser) ---
+echo Checking google-chrome in WSL ...
+wsl -d Ubuntu -- bash -c "command -v google-chrome >/dev/null"
 if errorlevel 1 (
-    echo WARNING: playwright install chromium failed. You may need to run it manually later.
+    echo Installing google-chrome inside WSL ...
+    wsl -d Ubuntu -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget gnupg ca-certificates >/dev/null 2>&1; mkdir -p /etc/apt/keyrings; wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-linux.gpg; echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux.gpg] https://dl.google.com/linux/chrome/deb/ stable main' > /etc/apt/sources.list.d/google-chrome.list; DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq google-chrome-stable >/dev/null 2>&1"
 )
 
-REM Prompt for ANTHROPIC_API_KEY if .env missing
+REM --- kuri install inside WSL (idempotent) ---
+echo Checking kuri in WSL ...
+wsl -d Ubuntu -- bash -c "test -x /root/.local/bin/kuri || curl -fsSL https://raw.githubusercontent.com/justrach/kuri/main/install.sh | sh"
+if errorlevel 1 (
+    echo ERROR: failed to install kuri inside WSL.
+    pause
+    exit /b 1
+)
+
+echo.
+echo NOTE: The kuri install script currently ships v0.4.4. The CDP-detach fix
+echo for Instagram landed in v0.4.5 ^(commit 648fe344, issue #172^) but is not
+echo yet published as a release binary. If you see CDP errors after navigating
+echo to instagram.com, you need v0.4.5 — build from source inside WSL:
+echo   cd /root ^&^& git clone --branch v0.4.5 https://github.com/justrach/kuri.git kuri-src
+echo   cd kuri-src ^&^& zig build -Doptimize=ReleaseFast
+echo   cp zig-out/bin/kuri /root/.local/bin/kuri
+echo.
+
+REM --- .env: ANTHROPIC_API_KEY + KURI_API_TOKEN ---
 if not exist ".env" (
+    echo. > .env
+)
+
+findstr /B /C:"ANTHROPIC_API_KEY=" .env >nul 2>&1
+if errorlevel 1 (
     echo.
-    echo No .env file found. Please paste your Anthropic API key.
-    echo It will be saved to .env in this folder.
     set /p APIKEY=ANTHROPIC_API_KEY:
-    if "!APIKEY!"=="" (
-        echo No key entered, skipping .env creation. You can create it later from .env.example.
-    ) else (
-        > .env echo ANTHROPIC_API_KEY=!APIKEY!
-        echo Wrote .env
+    if "!APIKEY!" NEQ "" (
+        echo ANTHROPIC_API_KEY=!APIKEY!>> .env
     )
-) else (
-    echo .env already exists, leaving it alone.
+)
+
+findstr /B /C:"KURI_API_TOKEN=" .env >nul 2>&1
+if errorlevel 1 (
+    for /f %%t in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString('N')"') do set TOK=%%t
+    echo KURI_API_TOKEN=!TOK!>> .env
+    echo Generated KURI_API_TOKEN.
+)
+
+findstr /B /C:"PYTHONIOENCODING=" .env >nul 2>&1
+if errorlevel 1 (
+    echo PYTHONIOENCODING=utf-8>> .env
 )
 
 echo.

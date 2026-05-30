@@ -1,23 +1,30 @@
-"""Browser-use powered Instagram scraper with incremental checkpointing.
+"""Kuri-driven Instagram scraper with incremental checkpointing.
 
-Reels-first task order: reposts are the #1 dating-recon signal so we collect those
-before anything else. Each piece of data the agent extracts is written to disk
-through a custom save_* action — so if browser-use terminates from LLM timeouts
-or repeated failures, the partial file on disk still has everything collected so
-far. Nothing is lost on crash.
+Each piece of data the agent extracts is written to disk through a dedicated
+save_* tool action, so if the loop dies (LLM timeout, context bloat, exception)
+the partial file on disk still has everything collected so far. Public surface
+(ScrapeResult, CheckpointStore, scrape_self/target/focused_scrape, PROFILE_DIR)
+is preserved so analyze.py / server.py / render.py work unchanged.
 
-Same output schema as before — analyze.py / main.py / server.py keep working.
+Engine: kuri (https://github.com/justrach/kuri) v0.4.5+ drives Chrome over CDP
+via its HTTP API; Claude (Sonnet 4.6) issues tool calls in a loop. Kuri's
+v0.4.5 auto-recovers the CDP session after Chrome's renderer swap on Instagram
+(see kuri#172) so the loop stays alive across navigations.
 """
-import asyncio
-import json
-from pathlib import Path
-from typing import Callable, Optional
+from __future__ import annotations
 
+import asyncio
+import base64
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from anthropic import Anthropic
 from pydantic import BaseModel, Field
 
-from browser_use import Agent, Browser, BrowserProfile, ChatAnthropic, Controller
-from browser_use.browser.views import BrowserStateSummary
-from browser_use.agent.views import AgentOutput
+from kuri_client import Kuri, KuriError, KuriTab
 
 # Narrate callback signature used by the web layer: (step, thinking, next_goal).
 NarrateCb = Optional[Callable[[int, str, str], None]]
@@ -26,14 +33,12 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = "claude-sonnet-4-6"
-# Long timeout — context bloats heavily by step 40+ when the agent has collected
-# a lot of data. 90s default was too tight; 180s gives Sonnet room.
-LLM_TIMEOUT_S = 180
-MAX_FAILURES = 10
+MODEL = os.environ.get("INSTACLAW_MODEL", "claude-sonnet-4-6")
+LLM_TIMEOUT_S = int(os.environ.get("INSTACLAW_LLM_TIMEOUT", "180"))
+MAX_TURNS = int(os.environ.get("INSTACLAW_MAX_TURNS", "60"))
 
 
-# ---------- output schema (kept for type compatibility — partial files match this) ----------
+# ---------- output schema (matches the prior browser-use version) ----------
 class Header(BaseModel):
     name: str = ""
     header_text: str = ""
@@ -83,15 +88,9 @@ class ScrapeResult(BaseModel):
     saved: Optional[list[UrlOnly]] = None
 
 
-# ---------- checkpoint store (writes after every save_*) ----------
+# ---------- checkpoint store ----------
 class CheckpointStore:
-    """Holds the in-progress scrape result and flushes to disk on every change.
-
-    The agent calls save_* actions throughout the scrape. Each call mutates the
-    store and immediately flushes. If browser-use terminates the agent for any
-    reason (timeouts, max failures, exception), the file already contains
-    everything collected up to that moment.
-    """
+    """Holds the in-progress scrape result and flushes to disk on every change."""
     def __init__(self, path: Path, mode: str, handle: str):
         self.path = path
         self.state: dict = {
@@ -148,149 +147,39 @@ class CheckpointStore:
         return dict(self.state)
 
 
-# ---------- narration callback ----------
-def _narrate(state: BrowserStateSummary, output: AgentOutput, step: int) -> None:
-    cs = output.current_state
-    if cs.thinking:
-        print(f">>> [{step}] {cs.thinking.strip()}")
-    if cs.next_goal:
-        print(f">>> [{step}] next: {cs.next_goal.strip()}")
-
-
-def _make_callback(extra: NarrateCb):
-    def cb(state: BrowserStateSummary, output: AgentOutput, step: int) -> None:
-        _narrate(state, output, step)
-        if extra is not None:
-            cs = output.current_state
-            try:
-                extra(step, (cs.thinking or "").strip(), (cs.next_goal or "").strip())
-            except Exception as e:
-                print(f">>> [narrate-cb error] {e}")
-    return cb
-
-
-# ---------- controller with incremental-save actions ----------
-def _make_controller(store: CheckpointStore) -> Controller:
-    """Register save_* actions that the agent calls as it collects each piece of data.
-
-    Each action immediately flushes to disk so the partial file is always current.
-    The agent is told (in the task prompt) to call these as it goes, not at the end.
-    """
-    controller = Controller()
-
-    @controller.action(
-        "Save the profile header. Call this once, right after extracting name/bio/stats."
-    )
-    async def save_header(name: str, header_text: str, stats_raw: list[str]) -> str:
-        store.set_header(name, header_text, stats_raw)
-        return f"header saved: name={name!r}"
-
-    @controller.action(
-        "Mark this target account as PRIVATE. Call this if the profile shows "
-        "'This Account is Private' or 'This profile is private' and you cannot see content."
-    )
-    async def mark_private() -> str:
-        store.mark_private()
-        return "marked private"
-
-    @controller.action(
-        "Save one reel from the Reels tab. Call this AFTER opening and reading the reel — "
-        "URL path like '/reel/ABC/', caption text, creator (especially the original poster's "
-        "@handle for REPOSTS), and the audio track name shown at the bottom."
-    )
-    async def save_reel(url: str, caption: str, creator: str, audio: str) -> str:
-        store.add_reel(url, caption, creator, audio)
-        return f"reel #{len(store.state['reels'])} saved: {url}"
-
-    @controller.action(
-        "Save one story highlight bubble. Call this after clicking through all its slides. "
-        "Provide: title (label under the bubble, e.g. 'travel'), cover_text (any text on the "
-        "bubble before opening), and slides (one short string per slide — caption overlays, "
-        "location stamps, audio track names, sticker text)."
-    )
-    async def save_highlight(title: str, cover_text: str, slides: list[str]) -> str:
-        store.add_highlight(title, cover_text, slides)
-        return f"highlight #{len(store.state['highlights'])} saved: {title!r} ({len(slides)} slides)"
-
-    @controller.action(
-        "Save one grid post. Call this after opening the post and reading caption + top comments + likes."
-    )
-    async def save_grid_post(url: str, caption: str, comments: list[str], likes_raw: str) -> str:
-        store.add_grid_post(url, caption, comments, likes_raw)
-        return f"grid post #{len(store.state['grid'])} saved: {url}"
-
-    @controller.action(
-        "Save one mutual follower (a person on 'Followed by ... others you follow'). "
-        "TARGET MODE ONLY. handle without @, display_name as shown."
-    )
-    async def save_mutual(handle: str, display_name: str) -> str:
-        store.add_mutual(handle, display_name)
-        return f"mutual #{len(store.state['mutuals'])} saved: @{handle}"
-
-    @controller.action(
-        "Save one tagged post URL (just the URL path, no captions needed)."
-    )
-    async def save_tagged(url: str) -> str:
-        store.add_tagged(url)
-        return f"tagged #{len(store.state['tagged'])} saved"
-
-    @controller.action(
-        "Save one saved post URL. SELF MODE ONLY. Just the URL path."
-    )
-    async def save_saved(url: str) -> str:
-        store.add_saved(url)
-        return f"saved #{len(store.state.get('saved') or [])} saved"
-
-    @controller.action(
-        "Save one account from the Following modal. handle without @, display_name as shown."
-    )
-    async def save_following(handle: str, display_name: str) -> str:
-        store.add_following(handle, display_name)
-        return f"following #{len(store.state['following'])} saved: @{handle}"
-
-    return controller
-
-
-# ---------- task prompts (REELS FIRST) ----------
+# ---------- task prompts ----------
 GLOBAL_RULES = """
 HARD RULES (apply to every step):
 - IGNORE the Explore feed, "Suggested Posts", "Suggested for you", and any popup or
   banner that says "Open in app", "See notifications", "Turn on notifications",
   "Log in to see more", or asks to save login info. Dismiss them and keep going.
-- Do NOT click on stories, ads, or sidebars. Stay on the profile / reels / tagged
-  surfaces only.
+- Do NOT click on stories, ads, or sidebars. Stay on the profile / reposts /
+  highlights / grid surfaces only.
 - If a surface fails to load after 2 attempts, SKIP it and move on. Never get stuck.
-- "Most recent" means top-left of the grid, top of the reels tab, etc.
-- URLs in path form: "/p/ABC123/" or "/reel/XYZ/" (no domain).
-- CHECKPOINT EVERYTHING. Call the save_* action immediately after extracting each
-  piece of data. Do not batch — save_header right after reading the header, save_reel
-  right after each reel, save_highlight right after closing each highlight. If the
-  loop dies, only the data you saved is preserved.
+- URLs in path form: "/p/ABC/" or "/reel/XYZ/" (no domain).
+- CHECKPOINT EVERYTHING. Call the save_* tool immediately after extracting each
+  piece of data — not at the end. If the loop dies, only the data you saved is
+  preserved.
+- Use snap_interactive to see clickable elements with stable refs (e.g. e12),
+  then click(ref). After a navigation or DOM mutation, snap again — refs change.
+- Use screenshot only when text/snapshot tools aren't enough (reel caption
+  overlays burned into video, audio names rendered as part of the visual UI).
 """
 
 
 def _self_task(handle: str) -> str:
     return f"""You are scraping the Instagram account @{handle} (the logged-in user's own account).
 
-Go to https://www.instagram.com/{handle}/ — collect THREE surfaces, in this order:
+Go to https://www.instagram.com/{handle}/reposts/ for STEP 1, then collect surfaces in this order:
 
-**STEP 1: REPOSTS TAB — THE MAIN EVENT. THIS IS NOT THE REELS TAB.**
-On an Instagram profile there is a row of tab icons under the bio: Posts (grid),
-Reels (play-arrow), REPOSTS (circular-arrows / repost icon), Tagged.
-The REPOSTS tab is where things the user has reposted from OTHER creators live.
-This is what we need — what they share/boost is the highest-signal taste data.
+**STEP 1 (CRITICAL): REPOSTS TAB — the main event. THIS IS NOT THE REELS TAB.**
+/{handle}/reposts/ is the dedicated Reposts surface. What the user has boosted
+from other creators is the highest-fidelity taste signal on the whole profile.
 
-Click the REPOSTS tab on /{handle}/. It's distinct from the Reels tab and from
-the grid. If you can't find a Reposts tab on the profile, try the Reels tab
-INSTEAD as a fallback (some accounts route reposts through Reels).
+**TARGET: 20 reposts minimum, 30 max.** Scroll the modal to load more.
 
-**TARGET: 20 reposts minimum, 30 max** — collect AT LEAST 20 if they exist;
-stop at 30. Scroll to load more if the visible set is smaller. Only stop short
-of 20 if the tab genuinely has fewer items.
-
-Per repost: URL path, caption, creator (the ORIGINAL POSTER's @handle, not
-@{handle} — distinguishing the original creator is the whole point), audio
-track name.
+Per repost: URL path, caption, creator (the ORIGINAL POSTER's @handle, NOT
+@{handle}; the whole point is distinguishing original creators), audio track.
 Call **save_reel** after each one. Save as you go.
 
 **STEP 2: STORY HIGHLIGHTS — pinned identity.**
@@ -310,34 +199,30 @@ Don't touch saved, tagged, or Following — those aren't needed.
 
 {GLOBAL_RULES}
 
-Finish when done or by step 50. Everything is on disk via save_* calls.
+Finish when done or by step 50. Everything is on disk via save_* calls; ending
+the loop is fine. Stop calling tools when there's nothing left to collect.
 """
 
 
 def _target_task(handle: str) -> str:
-    return f"""You are scraping the Instagram account @{handle} (someone else — vibe check for the user).
+    return f"""You are scraping the Instagram account @{handle} (someone else, vibe check for the user).
 
 Go to https://www.instagram.com/{handle}/.
 
 **FIRST: privacy gate.**
 If you see "This Account is Private" or "This profile is private" and there is NO
 visible content beyond the header, call **mark_private**, then call **save_header**
-with whatever header data is visible, and STOP. Don't try to bypass.
+with whatever header data is visible, and stop. Don't try to bypass.
 
-Otherwise collect surfaces in THIS ORDER:
+Otherwise navigate to /{handle}/reposts/ for STEP 1, then collect:
 
-**STEP 1 (CRITICAL): REPOSTS TAB — the main event. NOT the Reels tab.**
-On the profile, find the row of tab icons: Posts, Reels, REPOSTS (circular-arrows
-icon), Tagged. Click the REPOSTS tab. That's what they've boosted from other
-creators — highest-signal taste data.
+**STEP 1 (CRITICAL): REPOSTS TAB — the main event.**
+/{handle}/reposts/ is the dedicated Reposts surface. What the target has boosted
+from other creators is the highest-fidelity taste signal.
 
-If a Reposts tab is not visible (smaller/older accounts), fall back to the Reels
-tab.
+**TARGET: 20 reposts minimum, 30 max.** Scroll to load more.
 
-**TARGET: 20 reposts minimum, 30 max** — at least 20 if they exist, stop at 30.
-Scroll to load more.
-
-Per repost: URL, caption, creator (the ORIGINAL POSTER's @handle), audio track.
+Per repost: URL, caption, creator (the ORIGINAL poster's @handle), audio track.
 Call **save_reel** after each. Save as you go.
 
 **STEP 2: STORY HIGHLIGHTS — pinned identity.**
@@ -352,7 +237,11 @@ Display name, bio, stats. Call **save_header** once.
 Up to 5 most recent grid posts. Per post: URL, caption, ~5 top comments, likes.
 Call **save_grid_post** after each.
 
-Don't touch mutuals, tagged, saved, or Following — keep it tight.
+**STEP 5: TAGGED — partner-signal sweep.**
+/{handle}/tagged/ often reveals a partner or close friend who tags the target
+repeatedly. Collect up to 8 tagged URLs. Call **save_tagged** each.
+
+Don't touch mutuals, Following, or Saved — keep it tight.
 
 {GLOBAL_RULES}
 
@@ -360,44 +249,313 @@ Finish when done or by step 50. Everything is on disk via save_* calls.
 """
 
 
-# ---------- agent runners ----------
-def _browser() -> Browser:
-    # Bundled chromium (no channel="chrome") avoids single-instance collision
-    # with the user's normal Chrome.
-    profile = BrowserProfile(
-        user_data_dir=str(PROFILE_DIR),
-        headless=False,
-    )
-    return Browser(browser_profile=profile)
+# ---------- tool schema ----------
+def _tools(mode: str) -> list[dict]:
+    save_tools: list[dict] = [
+        {
+            "name": "save_header",
+            "description": "Save the profile header. Call once after extracting name/bio/stats.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "header_text": {"type": "string"},
+                    "stats_raw": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name", "header_text", "stats_raw"],
+            },
+        },
+        {
+            "name": "mark_private",
+            "description": "Mark this target account as PRIVATE. Call only when the page shows the private wall and content is not visible.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "save_reel",
+            "description": "Save one repost from the Reposts tab. URL path like /p/ABC/ or /reel/XYZ/, caption, creator (especially the ORIGINAL poster for reposts), audio track name.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "caption": {"type": "string"},
+                    "creator": {"type": "string"},
+                    "audio": {"type": "string"},
+                },
+                "required": ["url", "caption", "creator", "audio"],
+            },
+        },
+        {
+            "name": "save_highlight",
+            "description": "Save one story highlight bubble after clicking through all its slides.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "cover_text": {"type": "string"},
+                    "slides": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "cover_text", "slides"],
+            },
+        },
+        {
+            "name": "save_grid_post",
+            "description": "Save one grid post after opening it and reading caption + top comments + likes.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "caption": {"type": "string"},
+                    "comments": {"type": "array", "items": {"type": "string"}},
+                    "likes_raw": {"type": "string"},
+                },
+                "required": ["url", "caption", "comments", "likes_raw"],
+            },
+        },
+        {
+            "name": "save_tagged",
+            "description": "Save one tagged post URL. TARGET MODE only.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    ]
+    if mode == "self":
+        save_tools.append({
+            "name": "save_saved",
+            "description": "Save one saved post URL. SELF MODE only.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        })
+
+    browser_tools: list[dict] = [
+        {
+            "name": "navigate",
+            "description": "Navigate the current tab to a URL. Full https URLs.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+        {
+            "name": "snap_interactive",
+            "description": "Return interactive elements on the current page as a list of {ref, role, name}. Refs (e0, e1, ...) are stable until the DOM mutates.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "snap_text",
+            "description": "Return the full a11y tree as indented text. Use when you need non-interactive content like captions or comments.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "page_text",
+            "description": "Return all visible text on the page. Heavier than snap_text.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "click",
+            "description": "Click an element by its ref from snap_interactive.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
+            },
+        },
+        {
+            "name": "type",
+            "description": "Type text into an input element identified by ref.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "text": {"type": "string"},
+                    "submit": {"type": "boolean", "description": "Press Enter after typing"},
+                },
+                "required": ["ref", "text"],
+            },
+        },
+        {
+            "name": "scroll",
+            "description": "Scroll the page by dy pixels (positive = down).",
+            "input_schema": {
+                "type": "object",
+                "properties": {"dy": {"type": "integer"}},
+                "required": ["dy"],
+            },
+        },
+        {
+            "name": "back",
+            "description": "Browser back button.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "current_url",
+            "description": "Get the current page URL.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "screenshot",
+            "description": "Take a screenshot of the current page and return it as a visible image. Use only when text tools aren't enough (reel caption overlays burned into video, audio overlays, photo content).",
+            "input_schema": {
+                "type": "object",
+                "properties": {"full_page": {"type": "boolean"}},
+            },
+        },
+    ]
+    return browser_tools + save_tools
+
+
+# ---------- tool dispatch ----------
+def _execute_tool(tab: KuriTab, store: CheckpointStore, name: str, args: dict) -> Any:
+    """Run a tool call. Returns either a string (text tool_result) or a list of
+    Anthropic content blocks (used for image responses from screenshot)."""
+    try:
+        # ---- save_* (checkpoint to disk) ----
+        if name == "save_header":
+            store.set_header(args["name"], args["header_text"], args.get("stats_raw", []))
+            return f"header saved: name={args['name']!r}"
+        if name == "mark_private":
+            store.mark_private()
+            return "marked private"
+        if name == "save_reel":
+            store.add_reel(args["url"], args["caption"], args["creator"], args["audio"])
+            return f"reel #{len(store.state['reels'])} saved: {args['url']}"
+        if name == "save_highlight":
+            store.add_highlight(args["title"], args.get("cover_text", ""), args.get("slides", []))
+            return f"highlight #{len(store.state['highlights'])} saved: {args['title']!r} ({len(args.get('slides', []))} slides)"
+        if name == "save_grid_post":
+            store.add_grid_post(args["url"], args["caption"], args.get("comments", []), args.get("likes_raw", ""))
+            return f"grid post #{len(store.state['grid'])} saved: {args['url']}"
+        if name == "save_tagged":
+            store.add_tagged(args["url"])
+            return f"tagged #{len(store.state['tagged'])} saved"
+        if name == "save_saved":
+            store.add_saved(args["url"])
+            return f"saved #{len(store.state.get('saved') or [])} saved"
+
+        # ---- browser tools (kuri) ----
+        if name == "navigate":
+            tab.goto(args["url"])
+            time.sleep(2.5)
+            return f"navigated to {tab.url()}"
+        if name == "snap_interactive":
+            nodes = tab.snap(interactive_only=True)
+            return json.dumps([{"ref": n.ref, "role": n.role, "name": n.name} for n in nodes])
+        if name == "snap_text":
+            return tab.snap_text()
+        if name == "page_text":
+            return tab.text()[:6000]
+        if name == "click":
+            tab.click(args["ref"])
+            time.sleep(1.2)
+            return "clicked"
+        if name == "type":
+            tab.type(args["ref"], args["text"], submit=args.get("submit", False))
+            time.sleep(0.6)
+            return "typed"
+        if name == "scroll":
+            tab.scroll(int(args["dy"]))
+            time.sleep(0.8)
+            return "scrolled"
+        if name == "back":
+            tab.back()
+            time.sleep(1.5)
+            return f"back -> {tab.url()}"
+        if name == "current_url":
+            return tab.url()
+        if name == "screenshot":
+            png = tab.screenshot(full_page=bool(args.get("full_page", False)))
+            return [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                              "data": base64.b64encode(png).decode("ascii")}},
+                {"type": "text", "text": f"screenshot of {tab.url()}"},
+            ]
+        return f"unknown tool: {name}"
+    except KuriError as e:
+        return f"tool error: {e}"
+    except Exception as e:
+        return f"tool error: {type(e).__name__}: {e}"
+
+
+# ---------- agent loop ----------
+def _short_args(d: dict) -> str:
+    s = json.dumps(d, ensure_ascii=False)
+    return s if len(s) < 80 else s[:77] + "..."
 
 
 async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
     out_path = OUT_DIR / f"{mode}_{handle}.json"
     store = CheckpointStore(out_path, mode, handle)
-    browser = _browser()
-    llm = ChatAnthropic(model=MODEL, timeout=LLM_TIMEOUT_S)
-    controller = _make_controller(store)
-    agent = Agent(
-        task=task,
-        llm=llm,
-        browser=browser,
-        controller=controller,
-        register_new_step_callback=_make_callback(narrate),
-        max_actions_per_step=5,
-        max_failures=MAX_FAILURES,
-        use_vision=True,
-    )
+
+    k = Kuri()
     try:
-        await agent.run()
-    except Exception as e:
-        print(f">>> agent.run() raised {type(e).__name__}: {e}")
-    # Whatever happened, the file on disk has everything that got checkpointed.
+        tab = k.first_tab()
+    except KuriError as e:
+        raise KuriError(f"kuri not reachable (start it first): {e}") from e
+
+    tools = _tools(mode)
+    client = Anthropic(timeout=LLM_TIMEOUT_S)
+
+    messages: list[dict] = [{"role": "user", "content": "Begin. Use the tools to complete the task above."}]
+    system = [
+        {"type": "text", "text": task, "cache_control": {"type": "ephemeral"}},
+    ]
+
+    for step in range(1, MAX_TURNS + 1):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                system=system,
+                tools=tools,
+                messages=messages,
+            )
+        except Exception as e:
+            print(f">>> [{step}] LLM call failed: {type(e).__name__}: {e}")
+            break
+
+        thinking_chunks = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+        thinking = "\n".join(thinking_chunks).strip()
+
+        tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
+        next_goal = ", ".join(f"{tu.name}({_short_args(tu.input or {})})" for tu in tool_uses) if tool_uses else ""
+
+        if thinking or next_goal:
+            print(f">>> [{step}] {thinking}".rstrip())
+            if next_goal:
+                print(f">>> [{step}] next: {next_goal}")
+            if narrate is not None:
+                try:
+                    narrate(step, thinking, next_goal)
+                except Exception as e:
+                    print(f">>> [narrate-cb error] {e}")
+
+        messages.append({"role": "assistant", "content": resp.content})
+
+        # No tool calls = agent decided it's done.
+        if not tool_uses:
+            break
+
+        results: list[dict] = []
+        for tu in tool_uses:
+            out = _execute_tool(tab, store, tu.name, tu.input or {})
+            if isinstance(out, str) and len(out) > 8000:
+                out = out[:8000] + "\n... [truncated]"
+            results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
+
+        messages.append({"role": "user", "content": results})
+
+    # Whatever happened, the checkpoint file on disk is the canonical result.
     return json.loads(out_path.read_text(encoding="utf-8"))
 
 
 def _write(data: dict, mode: str, handle: str) -> dict:
-    # The checkpoint store already wrote the file. This is just for the log line
-    # and to return the canonical dict.
+    # CheckpointStore already wrote the file; this is just for the log line.
     out_path = OUT_DIR / f"{mode}_{handle}.json"
     if not out_path.exists():
         out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -419,7 +577,7 @@ def scrape_target(handle: str, narrate: NarrateCb = None) -> dict:
 
 # ---------- focused investigation used by the chat layer ----------
 async def focused_scrape(query: str, base_handle: str, narrate: NarrateCb = None) -> str:
-    """Open browser-use agent for a follow-up question. Returns prose evidence."""
+    """Open a kuri-driven Claude loop for a follow-up question. Returns prose evidence."""
     task = f"""You are investigating Instagram for a follow-up question about @{base_handle}.
 
 QUESTION: {query}
@@ -430,24 +588,70 @@ repost). Read posts, captions, comments, and reels as needed.
 
 {GLOBAL_RULES}
 
-Return your answer as PROSE EVIDENCE — not JSON. Cite specific posts (URL path),
-specific commenters (@handle), specific reels, captions, or audio tracks you saw.
-If you couldn't find an answer, say so plainly and describe what you did look at.
-Keep it under ~400 words. No speculation beyond what's visible.
+When you have an answer, STOP calling tools — your final text response IS the
+answer. Cite specific posts (URL path), commenters (@handle), reels, captions,
+or audio tracks you saw. If you couldn't find an answer, say so plainly and
+describe what you did look at. Keep it under ~400 words. No speculation beyond
+what's visible.
 """
-    browser = _browser()
-    llm = ChatAnthropic(model=MODEL, timeout=LLM_TIMEOUT_S)
-    agent = Agent(
-        task=task,
-        llm=llm,
-        browser=browser,
-        register_new_step_callback=_make_callback(narrate),
-        max_actions_per_step=5,
-        max_failures=MAX_FAILURES,
-        use_vision=True,
-    )
-    history = await agent.run()
-    return (history.final_result() or "").strip() or "(no evidence found)"
+
+    k = Kuri()
+    tab = k.first_tab()
+    # Reuse the browser tool list (no save_* — this returns prose)
+    tools = [t for t in _tools("target") if not t["name"].startswith("save_") and t["name"] != "mark_private"]
+    client = Anthropic(timeout=LLM_TIMEOUT_S)
+
+    # Throwaway store so _execute_tool's signature works; we never call save_*.
+    store = CheckpointStore(OUT_DIR / f"_focused_{base_handle}.tmp.json", "target", base_handle)
+
+    messages: list[dict] = [{"role": "user", "content": "Begin investigating to answer the question above."}]
+    system = [{"type": "text", "text": task, "cache_control": {"type": "ephemeral"}}]
+
+    final_text = ""
+    for step in range(1, MAX_TURNS + 1):
+        try:
+            resp = await asyncio.to_thread(
+                client.messages.create,
+                model=MODEL, max_tokens=4096, system=system, tools=tools, messages=messages,
+            )
+        except Exception as e:
+            print(f">>> [focused {step}] LLM failed: {type(e).__name__}: {e}")
+            break
+
+        thinking_chunks = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+        text = "\n".join(thinking_chunks).strip()
+        tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
+        next_goal = ", ".join(f"{tu.name}({_short_args(tu.input or {})})" for tu in tool_uses) if tool_uses else ""
+
+        if text or next_goal:
+            print(f">>> [focused {step}] {text}".rstrip())
+            if next_goal:
+                print(f">>> [focused {step}] next: {next_goal}")
+            if narrate is not None:
+                try:
+                    narrate(step, text, next_goal)
+                except Exception:
+                    pass
+
+        messages.append({"role": "assistant", "content": resp.content})
+        if not tool_uses:
+            final_text = text
+            break
+
+        results: list[dict] = []
+        for tu in tool_uses:
+            out = _execute_tool(tab, store, tu.name, tu.input or {})
+            if isinstance(out, str) and len(out) > 8000:
+                out = out[:8000] + "\n... [truncated]"
+            results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
+        messages.append({"role": "user", "content": results})
+
+    try:
+        (OUT_DIR / f"_focused_{base_handle}.tmp.json").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return final_text.strip() or "(no evidence found)"
 
 
 if __name__ == "__main__":

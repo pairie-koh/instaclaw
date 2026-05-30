@@ -61,17 +61,24 @@ should be fine.
 Analysis (`analyze.py`) should stay on Sonnet since it's only 1-2 calls per
 compatibility check and quality matters.
 
-## Move kuri off the back-burner once justrach ships the fix
+## Kuri migration (status: DONE, this branch)
 
-Open issue: https://github.com/justrach/kuri/issues/172 — Chrome's site
-isolation kicks in on Instagram (cross-origin Facebook iframe + service worker)
-and detaches the CDP session, but kuri's `CdpClient` never handles
-`Target.detachedFromTarget` / `attachedToTarget` events. All work lives on the
-`kuri-experiment` branch ready to re-enable.
+The issue (https://github.com/justrach/kuri/issues/172) was fixed in kuri
+v0.4.5 (commit `648fe344`): `CdpClient` marks dead on WS send/receive failure,
+`getCdpClient` re-fetches `/json/list` to pick up the fresh
+`webSocketDebuggerUrl` Chrome assigned after the renderer swap, rebuilds the
+client. `kuri_client._get` wraps that with one retry on `502 "CDP command
+failed"` so the recovery is invisible to callers.
 
-Win if it lands: token costs drop ~2× (no vision screenshots, just compact a11y
-snaps), and the surface is designed for agent loops (stable refs, batch
-endpoint). Same architecture, fewer turns.
+Caveat: v0.4.5 is tagged but not yet published as a release binary. Until
+Rach cuts a release, `setup.bat` falls back to `install.sh` which still ships
+v0.4.4 — see the setup script's NOTE about building from source if the IG
+nav 502s prove unrecoverable. When the binary lands, the install script
+picks it up automatically.
+
+Win realized: dropped Playwright + browser-use entirely; the scrape now runs
+on a custom Claude tool-use loop against kuri's compact a11y snapshots. Token
+budget per turn is ~half what browser-use was sending.
 
 ## Instagrapi / network interception as a backend fallback
 

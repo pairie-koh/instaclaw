@@ -546,56 +546,42 @@ async def chat(body: ChatBody, request: Request):
 
 
 # ---------- /setup ----------
-def _open_login_window():
-    """Open a persistent-context Chrome window pointed at IG. Blocks this thread
-    until the user closes the window."""
-    from playwright.sync_api import sync_playwright
-    profile_dir = str(agent_scrape.PROFILE_DIR)
-    Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as pw:
-        # No channel="chrome" — Playwright's bundled chromium avoids the
-        # single-instance collision with the user's normal Chrome.
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=profile_dir, headless=False,
-            viewport=None, args=["--start-maximized"],
-        )
-        page = ctx.new_page()
-        page.goto("https://www.instagram.com/")
-        # Wait for the user to close the window manually.
-        closed = threading.Event()
-        ctx.on("close", lambda: closed.set())
-        try:
-            while not closed.is_set():
-                closed.wait(timeout=2.0)
-                # If all pages went away, treat as closed.
-                if not ctx.pages:
-                    break
-        except Exception:
-            pass
-        try:
-            ctx.close()
-        except Exception:
-            pass
+# Login flow: kuri owns the Chrome window (started non-headless by instaclaw.bat / .command).
+# /setup/connect points that window at instagram.com so the user can log in.
+# /setup/check asks kuri whether the current page shows a logged-in nav element.
+def _kuri_navigate_to_ig() -> None:
+    from kuri_client import Kuri
+    k = Kuri()
+    tab = k.first_tab()
+    tab.goto("https://www.instagram.com/")
 
 
 @app.post("/setup/connect")
 async def setup_connect():
-    # fire-and-forget — don't await
-    asyncio.create_task(asyncio.to_thread(_open_login_window))
-    return {"status": "opened"}
+    try:
+        await asyncio.to_thread(_kuri_navigate_to_ig)
+        return {"status": "opened"}
+    except Exception as e:
+        raise HTTPException(503, f"kuri not reachable: {e}")
 
 
 @app.get("/setup/check")
 async def setup_check():
-    base = agent_scrape.PROFILE_DIR / "Default"
-    # Newer chromium stores cookies under Default/Network/. Older builds
-    # used Default/ directly. Check both.
-    for sub in (base, base / "Network"):
-        for name in ("Cookies", "Cookies-journal"):
-            p = sub / name
-            if p.exists() and p.stat().st_size > 0:
-                return {"connected": True}
-    return {"connected": False}
+    from kuri_client import Kuri, KuriError
+    try:
+        k = Kuri()
+        tab = k.first_tab()
+        # IG renders avatar nav-link to /accounts/edit/ only when logged in.
+        has_nav = tab.evaluate(
+            "Boolean(document.querySelector(\"a[href*='/accounts/edit/']\") || "
+            "document.querySelector(\"a[href$='/accounts/activity/']\") || "
+            "document.querySelector(\"a[href*='/direct/inbox/']\"))"
+        )
+        return {"connected": bool(has_nav)}
+    except KuriError:
+        return {"connected": False}
+    except Exception:
+        return {"connected": False}
 
 
 # ---------- /history ----------
