@@ -7,18 +7,21 @@ the partial file on disk still has everything collected so far. Public surface
 is preserved so analyze.py / server.py / render.py work unchanged.
 
 Engine: kuri (https://github.com/justrach/kuri) v0.4.5+ drives Chrome over CDP
-via its HTTP API; DeepSeek issues tool calls in a loop. Kuri's v0.4.5
-auto-recovers the CDP session after Chrome's renderer swap on Instagram
-(see kuri#172) so the loop stays alive across navigations.
+via its HTTP API. The nav loop runs on a text LLM (DeepSeek V4-flash by default)
+via OpenRouter. The screenshot tool routes the captured PNG to a separate
+vision model (Qwen2.5-VL-72B by default), and returns the model's text
+description back to the nav loop — so the nav loop never sees raw images and
+stays cheap, while overlay text on reel video frames remains readable.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -32,16 +35,46 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek-v4-flash")
+MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek/deepseek-v4-flash")
+VISION_MODEL = os.environ.get("INSTACLAW_VISION_MODEL", "qwen/qwen2.5-vl-72b-instruct")
 LLM_TIMEOUT_S = int(os.environ.get("INSTACLAW_LLM_TIMEOUT", "180"))
 MAX_TURNS = int(os.environ.get("INSTACLAW_MAX_TURNS", "60"))
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 
 def _client() -> OpenAI:
-    return OpenAI(base_url=DEEPSEEK_BASE_URL,
-                  api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+    return OpenAI(base_url=OPENROUTER_BASE_URL,
+                  api_key=os.environ.get("OPENROUTER_API_KEY", ""),
                   timeout=LLM_TIMEOUT_S)
+
+
+def _describe_screenshot(png_bytes: bytes, current_url: str) -> str:
+    """Side call to a vision model. Returns a focused text description that the
+    text-only nav loop can consume as a tool_result string."""
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    try:
+        resp = _client().chat.completions.create(
+            model=VISION_MODEL,
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": (
+                        f"This is a screenshot of {current_url}. List every piece of "
+                        "text visible in the image, with priority on: text burned into "
+                        "video frames (overlay captions, audio track names, sticker "
+                        "text), text on image posts, and any handle / caption / count "
+                        "not already in plain DOM. Transcribe verbatim where possible. "
+                        "If no extra text is present beyond standard IG chrome, say so."
+                    )},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            }],
+        )
+        return (resp.choices[0].message.content or "").strip() or "(vision returned no description)"
+    except Exception as e:
+        return f"(vision call failed: {type(e).__name__}: {e})"
 
 
 # ---------- output schema (matches the prior browser-use version) ----------
@@ -168,9 +201,11 @@ HARD RULES (apply to every step):
   preserved.
 - Use snap_interactive to see clickable elements with stable refs (e.g. e12),
   then click(ref). After a navigation or DOM mutation, snap again — refs change.
-- Use snap_text and page_text for caption / comment / audio text. No vision is
-  available, so anything burned into a video frame (overlay text) cannot be
-  read — skip those and move on.
+- Use snap_text and page_text first for caption / comment / audio text. Use
+  the `screenshot` tool only when text tools aren't enough — overlay text
+  burned into reel video frames, audio names rendered as visual UI. The
+  screenshot is read by a separate vision model and returned to you as a
+  text description.
 """
 
 
@@ -335,6 +370,11 @@ def _tools(mode: str) -> list[dict]:
             {"dy": {"type": "integer"}}, ["dy"]),
         _fn("back", "Browser back button.", {}, []),
         _fn("current_url", "Get the current page URL.", {}, []),
+        _fn("screenshot",
+            "Capture a PNG of the current page, route it through a vision model, and return that model's text description. Use only when text tools (snap_text, page_text) aren't enough — e.g. overlay text burned into a reel video frame, audio name rendered as visual UI.",
+            {"full_page": {"type": "boolean",
+                           "description": "Capture the full scrollable page instead of just the viewport."}},
+            []),
     ]
     return browser_tools + save_tools
 
@@ -396,6 +436,11 @@ def _execute_tool(tab: KuriTab, store: CheckpointStore, name: str, args: dict) -
             return f"back -> {tab.url()}"
         if name == "current_url":
             return tab.url()
+        if name == "screenshot":
+            png = tab.screenshot(full_page=bool(args.get("full_page", False)))
+            current = tab.url()
+            description = _describe_screenshot(png, current)
+            return f"vision description of {current}:\n{description}"
         return f"unknown tool: {name}"
     except KuriError as e:
         return f"tool error: {e}"

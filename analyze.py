@@ -5,10 +5,10 @@ import re
 from pathlib import Path
 from openai import OpenAI
 
-MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek-v4-flash")
+MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek/deepseek-v4-flash")
 client = OpenAI(
-    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
 )
 
 # Few-shot anchors used by both prompts to calibrate "specific" vs "generic".

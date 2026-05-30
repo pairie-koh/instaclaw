@@ -33,11 +33,11 @@ OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
 STATIC_DIR = ROOT / "static"
 DB_PATH = OUT_DIR / "instaclaw.db"
-MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek-v4-flash")
+MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek/deepseek-v4-flash")
 
 llm_client = OpenAI(
-    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
 )
 
 

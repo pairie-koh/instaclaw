@@ -90,17 +90,17 @@ echo   cd kuri-src ^&^& zig build -Doptimize=ReleaseFast
 echo   cp zig-out/bin/kuri /root/.local/bin/kuri
 echo.
 
-REM --- .env: DEEPSEEK_API_KEY + KURI_API_TOKEN ---
+REM --- .env: OPENROUTER_API_KEY + KURI_API_TOKEN ---
 if not exist ".env" (
     echo. > .env
 )
 
-findstr /B /C:"DEEPSEEK_API_KEY=" .env >nul 2>&1
+findstr /B /C:"OPENROUTER_API_KEY=" .env >nul 2>&1
 if errorlevel 1 (
     echo.
-    set /p APIKEY=DEEPSEEK_API_KEY:
+    set /p APIKEY=OPENROUTER_API_KEY:
     if "!APIKEY!" NEQ "" (
-        echo DEEPSEEK_API_KEY=!APIKEY!>> .env
+        echo OPENROUTER_API_KEY=!APIKEY!>> .env
     )
 )
 

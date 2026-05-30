@@ -42,16 +42,18 @@ IG DOM and emit per-surface JS scrapers. Subsequent scrapes call those scrapers
 directly — no LLM-per-turn. First scrape: 10 min. Every scrape after: 30
 seconds. This is how Skyvern / Multi-on / Adept do it.
 
-## Vision for overlay text (status: DROPPED in DeepSeek swap)
+## Vision for overlay text (status: REROUTED via Qwen-VL)
 
-The prior Claude version had a `screenshot` tool so the model could read text
-burned into reel video overlays. `deepseek-chat` is text-only, so the tool was
-removed entirely in the DeepSeek swap. Net effect: ~70% input-token reduction
-per turn, faster nav, but anything burned into a video frame (overlay audio
-names, in-video captions) is no longer readable. If this matters more than the
-cost win, options are: route screenshot turns through a vision-capable model
-(e.g. an OpenAI-compatible vision endpoint), or switch the whole agent driver
-to a vision-capable model.
+The prior Claude version had a `screenshot` tool that returned an image
+content block to Claude directly. DeepSeek V4-flash is text-only, so an
+intermediate vision call is now in the loop: when the nav model calls
+`screenshot`, kuri captures the PNG, `_describe_screenshot` posts it to
+Qwen2.5-VL-72B (via OpenRouter), and the vision model's text description
+is returned to the nav loop as the tool_result string. The nav model
+never sees the raw image. Cost is ~$0.001 per screenshot call, so even
+heavy use stays well under a cent per scrape. Override
+`INSTACLAW_VISION_MODEL` to swap the vision route (GLM-4.5V,
+gpt-4o-mini, etc.).
 
 ## Kuri migration (status: DONE, this branch)
 
@@ -69,9 +71,9 @@ nav 502s prove unrecoverable. When the binary lands, the install script
 picks it up automatically.
 
 Win realized: dropped Playwright + browser-use entirely; the scrape now runs
-on a custom DeepSeek tool-use loop (OpenAI-compatible API) against kuri's
-compact a11y snapshots. Token budget per turn is ~half what browser-use was
-sending.
+on a custom DeepSeek tool-use loop (OpenRouter-routed, OpenAI-compatible API)
+against kuri's compact a11y snapshots, with Qwen-VL handling screenshot turns.
+Token budget per turn is ~half what browser-use was sending.
 
 ## Instagrapi / network interception as a backend fallback
 

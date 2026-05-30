@@ -12,7 +12,7 @@ call .venv\Scripts\activate.bat
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%a in (".env") do set %%a=%%b
 ) else (
-    echo WARNING: .env not found. Server will start but DeepSeek calls will fail.
+    echo WARNING: .env not found. Server will start but OpenRouter calls will fail.
 )
 
 if "%KURI_API_TOKEN%"=="" (
