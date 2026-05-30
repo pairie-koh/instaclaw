@@ -6,8 +6,7 @@ you're about to DM and it tells you whether you'd vibe, whether they're
 likely single, and gives you three openers tied to specific posts they
 reposted.
 
-This branch runs on [kuri](https://github.com/justrach/kuri) (v0.4.5+). For
-the previous browser-use + Playwright version, see `main`.
+Runs on [kuri](https://github.com/justrach/kuri) (v0.4.5+).
 
 Two modes:
 
@@ -143,12 +142,6 @@ which is how the IG login carries over between runs.
   by `setup.bat`.
 - `KURI_BASE_URL` — defaults to `http://127.0.0.1:8080`. Override if you're
   running kuri on a different host.
-
-## Other branches
-
-- `main` — earlier production version using browser-use + Playwright. Slower
-  and more expensive per scrape, but doesn't need WSL on Windows.
-- `kuri-experiment` — earlier WIP kuri swap, superseded by this branch.
 
 ## Future work
 
