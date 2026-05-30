@@ -47,16 +47,16 @@ pip install -r requirements.txt
 echo "Installing playwright chromium ..."
 playwright install chromium || echo "WARNING: playwright install chromium failed. You may need to run it manually later."
 
-# Prompt for ANTHROPIC_API_KEY if .env missing
+# Prompt for DEEPSEEK_API_KEY if .env missing
 if [ ! -f ".env" ]; then
     echo ""
-    echo "No .env file found. Please paste your Anthropic API key."
+    echo "No .env file found. Please paste your DeepSeek API key."
     echo "It will be saved to .env in this folder."
-    read -p "ANTHROPIC_API_KEY: " APIKEY
+    read -p "DEEPSEEK_API_KEY: " APIKEY
     if [ -z "$APIKEY" ]; then
         echo "No key entered, skipping .env creation. You can create it later from .env.example."
     else
-        echo "ANTHROPIC_API_KEY=$APIKEY" > .env
+        echo "DEEPSEEK_API_KEY=$APIKEY" > .env
         echo "Wrote .env"
     fi
 else

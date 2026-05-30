@@ -14,7 +14,7 @@ if [ -f ".env" ]; then
     source .env
     set +a
 else
-    echo "WARNING: .env not found. Server will start but Anthropic calls will fail."
+    echo "WARNING: .env not found. Server will start but DeepSeek calls will fail."
 fi
 
 (sleep 2 && open http://localhost:8000) &

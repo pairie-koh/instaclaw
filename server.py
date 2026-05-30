@@ -13,8 +13,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import os
+
 import aiosqlite
-from anthropic import Anthropic
+from openai import OpenAI
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,9 +33,12 @@ OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
 STATIC_DIR = ROOT / "static"
 DB_PATH = OUT_DIR / "instaclaw.db"
-MODEL = "claude-opus-4-7"
+MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek-v4-flash")
 
-anthropic_client = Anthropic()
+llm_client = OpenAI(
+    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+)
 
 
 # ---------- job state (in-memory) ----------
@@ -406,12 +411,15 @@ class ChatBody(BaseModel):
 
 
 CHAT_TOOL = {
-    "name": "fetch_more",
-    "description": "Investigate the target's IG further to find specific evidence for the user's question. Use sparingly — only when the cached scrape and readout don't already answer it.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"query": {"type": "string"}},
-        "required": ["query"],
+    "type": "function",
+    "function": {
+        "name": "fetch_more",
+        "description": "Investigate the target's IG further to find specific evidence for the user's question. Use sparingly — only when the cached scrape and readout don't already answer it.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
     },
 }
 
@@ -455,7 +463,7 @@ Rules:
 
 
 async def _chat_stream(body: ChatBody, request: Request):
-    """SSE generator implementing the Anthropic tool-use loop."""
+    """SSE generator implementing the DeepSeek tool-use loop."""
     job_row = await db_load_job(body.job_id)
     if job_row is None and body.job_id in JOBS:
         job_row = _job_to_response(JOBS[body.job_id])
@@ -468,9 +476,10 @@ async def _chat_stream(body: ChatBody, request: Request):
     system = _chat_system(job_row, target_pronouns=body.target_pronouns,
                           self_pronouns=body.self_pronouns)
 
-    # Build messages: prior conversation + this user message
+    # Build messages: system + prior conversation + this user message
     history = await db_load_chat(body.job_id)
-    messages: list[dict] = [{"role": m["role"], "content": m["content"]} for m in history]
+    messages: list[dict] = [{"role": "system", "content": system}]
+    messages.extend({"role": m["role"], "content": m["content"]} for m in history)
     messages.append({"role": "user", "content": body.message})
     await db_save_chat(body.job_id, "user", body.message)
 
@@ -483,26 +492,37 @@ async def _chat_stream(body: ChatBody, request: Request):
         yield sse({"type": "thinking", "content": "thinking..."})
 
         resp = await asyncio.to_thread(
-            anthropic_client.messages.create,
-            model=MODEL, max_tokens=1500, system=system,
+            llm_client.chat.completions.create,
+            model=MODEL, max_tokens=1500,
             tools=[CHAT_TOOL], messages=messages,
         )
-        tool_uses = [b for b in resp.content if b.type == "tool_use"]
-        text_parts = [b.text for b in resp.content if b.type == "text"]
+        msg = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
+        text = (msg.content or "").strip()
 
-        if not tool_uses:
-            final_text = "\n".join(t for t in text_parts if t).strip()
-            messages.append({"role": "assistant", "content": resp.content})
+        if not tool_calls:
+            final_text = text
+            messages.append({"role": "assistant", "content": msg.content or ""})
             break
 
-        for t in text_parts:
-            if t.strip():
-                yield sse({"type": "thinking", "content": t.strip()})
+        if text:
+            yield sse({"type": "thinking", "content": text})
 
-        messages.append({"role": "assistant", "content": resp.content})
-        tool_results = []
-        for tu in tool_uses:
-            query = (tu.input or {}).get("query", "")
+        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
+        assistant_msg["tool_calls"] = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.function.name,
+                          "arguments": tc.function.arguments or "{}"}}
+            for tc in tool_calls
+        ]
+        messages.append(assistant_msg)
+
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            query = args.get("query", "")
             yield sse({"type": "fetching", "query": query})
 
             loop = asyncio.get_event_loop()
@@ -527,10 +547,7 @@ async def _chat_stream(body: ChatBody, request: Request):
             evidence = await scrape_task
             evidence_collected.append(evidence)
             yield sse({"type": "evidence", "content": evidence})
-            tool_results.append({
-                "type": "tool_result", "tool_use_id": tu.id, "content": evidence})
-
-        messages.append({"role": "user", "content": tool_results})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": evidence})
 
     if not final_text:
         final_text = "(no reply)"

@@ -1,11 +1,15 @@
 """Turn scraped IG JSON into a readout. Two modes: aura (self) and vibe (self vs target)."""
 import json
+import os
 import re
 from pathlib import Path
-from anthropic import Anthropic
+from openai import OpenAI
 
-MODEL = "claude-sonnet-4-6"
-client = Anthropic()
+MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek-v4-flash")
+client = OpenAI(
+    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+)
 
 # Few-shot anchors used by both prompts to calibrate "specific" vs "generic".
 # Keep these visceral and weird — they set the ceiling.
@@ -129,37 +133,39 @@ def _extract_json(text: str) -> dict:
 
 
 def aura(self_data: dict) -> dict:
-    msg = client.messages.create(
+    resp = client.chat.completions.create(
         model=MODEL,
         max_tokens=4000,
-        system=SYSTEM_AURA,
-        messages=[{
-            "role": "user",
-            "content": f"IG scrape for @{self_data['handle']}. Write the aura readout.\n\n```json\n{json.dumps(self_data, ensure_ascii=False)[:180000]}\n```"
-        }],
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_AURA},
+            {"role": "user",
+             "content": f"IG scrape for @{self_data['handle']}. Write the aura readout.\n\n```json\n{json.dumps(self_data, ensure_ascii=False)[:180000]}\n```"},
+        ],
     )
-    return _extract_json(msg.content[0].text)
+    return _extract_json(resp.choices[0].message.content or "")
 
 
 def vibe(self_data: dict, target_data: dict, self_aura: dict | None = None) -> dict:
     self_summary = json.dumps(self_aura, ensure_ascii=False) if self_aura else "(no prior aura — derive briefly from the self scrape data below)"
-    msg = client.messages.create(
+    resp = client.chat.completions.create(
         model=MODEL,
         max_tokens=4000,
-        system=SYSTEM_VIBE,
-        messages=[{
-            "role": "user",
-            "content": (
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_VIBE},
+            {"role": "user",
+             "content": (
                 f"YOU (the user): @{self_data['handle']}\n"
                 f"Prior aura summary: {self_summary}\n\n"
                 f"YOUR FULL SCRAPE:\n```json\n{json.dumps(self_data, ensure_ascii=False)[:60000]}\n```\n\n"
                 f"TARGET: @{target_data['handle']}\n"
                 f"TARGET SCRAPE:\n```json\n{json.dumps(target_data, ensure_ascii=False)[:100000]}\n```\n\n"
                 "Write the vibe-check readout."
-            )
-        }],
+             )},
+        ],
     )
-    return _extract_json(msg.content[0].text)
+    return _extract_json(resp.choices[0].message.content or "")
 
 
 if __name__ == "__main__":

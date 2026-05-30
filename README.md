@@ -10,7 +10,7 @@ Runs on [kuri](https://github.com/justrach/kuri) (v0.4.5+).
 
 Two modes:
 
-- **Aura readout** (self) — Claude reads your Reposts tab, story highlights,
+- **Aura readout** (self) — DeepSeek reads your Reposts tab, story highlights,
   grid, and bio, and writes you a readout in the voice of a friend who's
   been paying attention. Headline, taste cluster, friend-group role, what
   you actually project. The kind of thing you screenshot to the group chat.
@@ -31,30 +31,32 @@ query and answers with cited evidence.
 ```
 your browser  →  uvicorn (localhost:8000)
                      |
-                     ├─ /scrape  →  Claude Sonnet 4.6 tool-use loop
-                     |                  ↓ (navigate / snap / click / screenshot / save_*)
+                     ├─ /scrape  →  DeepSeek tool-use loop
+                     |                  ↓ (navigate / snap / click / save_*)
                      |               kuri_client  →  HTTP  →  kuri server (WSL)
                      |                                          ↓ (CDP)
                      |                                       Chrome  →  instagram.com
                      |
-                     ├─ analyze.py  →  Claude Sonnet 4.6
+                     ├─ analyze.py  →  DeepSeek (JSON mode)
                      |                  (aura prompt for self, vibe prompt for target
                      |                   with cached self as comparison context)
                      |
-                     └─ /chat  →  Anthropic tool-use loop with fetch_more tool,
+                     └─ /chat  →  DeepSeek tool-use loop with fetch_more tool,
                                   fetch_more kicks off focused_scrape (another
-                                  kuri-driven Claude loop returning prose evidence)
+                                  kuri-driven DeepSeek loop returning prose evidence)
 ```
 
 Kuri runs in WSL on Windows and natively on macOS / Linux. It exposes
 Chrome's CDP via an HTTP API and serves compact a11y snapshots that the
-agent uses instead of vision-heavy screenshots. The Claude tool loop has
-both browser tools (`navigate`, `snap_interactive`, `click`, `screenshot`)
-and `save_*` tools (`save_reel`, `save_highlight`, `save_grid_post`,
-`save_header`, etc.) — each `save_*` writes the in-progress scrape JSON to
-disk immediately, so if the loop dies the file already contains everything
-collected so far. The analyze layer is a single Claude call per readout
-that turns the scrape JSON into a written card.
+agent uses instead of vision-heavy screenshots. The DeepSeek tool loop has
+browser tools (`navigate`, `snap_interactive`, `snap_text`, `page_text`,
+`click`, `type`, `scroll`, `back`, `current_url`) and `save_*` tools
+(`save_reel`, `save_highlight`, `save_grid_post`, `save_header`, etc.) —
+each `save_*` writes the in-progress scrape JSON to disk immediately, so
+if the loop dies the file already contains everything collected so far.
+No vision — `deepseek-chat` is text-only, so text burned into reel video
+overlays can't be read. The analyze layer is a single DeepSeek call per
+readout (JSON mode) that turns the scrape JSON into a written card.
 
 Output is HTML rendered server-side and served into an iframe on the
 single-page frontend. SSE streams the agent's live narration so you can
@@ -71,7 +73,7 @@ setup.bat
 This requires WSL2 with an Ubuntu distro (kuri only ships Linux binaries).
 The script will check WSL is available, create a Python `.venv`, pip-install
 requirements, install Google Chrome inside WSL (for kuri's managed browser),
-install kuri via its `install.sh`, and prompt for your `ANTHROPIC_API_KEY`
+install kuri via its `install.sh`, and prompt for your `DEEPSEEK_API_KEY`
 which gets stored in `.env`. A `KURI_API_TOKEN` is also generated.
 
 Note: at time of writing, kuri's stable install channel ships v0.4.4, but
@@ -107,18 +109,19 @@ compare against. Then:
 - Type any handle in the main input + click **Vibe check** to get a
   compatibility readout (it uses your cached aura as the reference).
 
-A full scrape runs about 25-35 minutes per profile (Claude driving the
+A full scrape runs about 25-35 minutes per profile (DeepSeek driving the
 browser through ~20 reposts, 5 highlights, 5 grid posts, header). Cost is
-typically $1-2 per scrape on Sonnet 4.6.
+typically pennies per scrape on `deepseek-v4-flash` — roughly an order of
+magnitude cheaper than the prior Sonnet 4.6 setup.
 
 ## Architecture
 
 - `server.py` — FastAPI app, SSE streaming, SQLite job persistence
-- `agent_scrape.py` — Claude tool-use loop, custom save_* tools, task
-  prompts for self vs target, driven through kuri
+- `agent_scrape.py` — DeepSeek tool-use loop (OpenAI-compatible API), custom
+  save_* tools, task prompts for self vs target, driven through kuri
 - `kuri_client.py` — thin HTTP wrapper around kuri (kuri runs in WSL,
   client talks to localhost:8080)
-- `analyze.py` — aura / vibe prompts + analyze functions
+- `analyze.py` — aura / vibe prompts + analyze functions (DeepSeek JSON mode)
 - `render.py` — HTML card rendering with markdown-bold support
 - `screenshot.py` — chromium CLI screenshot for sharing cards as PNGs
 - `static/index.html` — single-page frontend (no framework)
@@ -132,12 +135,15 @@ which is how the IG login carries over between runs.
 
 `.env`:
 
-- `ANTHROPIC_API_KEY` — required
-- `INSTACLAW_MODEL` — defaults to `claude-sonnet-4-6`. Set to
-  `claude-haiku-4-5-20251001` for ~3× cheaper / ~2× faster scrapes at
-  some reliability cost.
+- `DEEPSEEK_API_KEY` — required. Grab one at https://platform.deepseek.com.
+- `INSTACLAW_MODEL` — defaults to `deepseek-v4-flash`. `deepseek-v4-pro` is
+  available but too slow and expensive for the 60-turn nav loop. Note that
+  `deepseek-chat` and `deepseek-reasoner` are deprecated aliases that still
+  resolve to V4-flash modes.
 - `INSTACLAW_MAX_TURNS` — agent loop step ceiling. Default 60.
-- `INSTACLAW_LLM_TIMEOUT` — Anthropic client timeout in seconds. Default 180.
+- `INSTACLAW_LLM_TIMEOUT` — LLM client timeout in seconds. Default 180.
+- `DEEPSEEK_BASE_URL` — defaults to `https://api.deepseek.com/v1`. Override
+  to point at any OpenAI-compatible endpoint (e.g. a local proxy).
 - `KURI_API_TOKEN` — bearer token for the local kuri server. Auto-generated
   by `setup.bat`.
 - `KURI_BASE_URL` — defaults to `http://127.0.0.1:8080`. Override if you're
@@ -146,4 +152,4 @@ which is how the IG login carries over between runs.
 ## Future work
 
 See `FUTURE.md` for deferred items (mutuals scrape, compile-once-replay
-for sub-30s subsequent scrapes, Haiku swap, kuri re-enablement).
+for sub-30s subsequent scrapes, kuri re-enablement).

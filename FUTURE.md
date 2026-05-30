@@ -33,33 +33,25 @@ before adding another modal step.
 
 ## Faster scrape path (compile-once, replay)
 
-Currently each scrape is an LLM-driven loop: ~50 steps × $0.02-0.03 each. For a
-viral product the unit economics don't work.
+Each scrape is still an LLM-driven loop (~50 steps). On `deepseek-chat` the
+per-scrape cost is pennies, so the unit economics are no longer the blocker —
+latency is. Still useful to compile once and replay:
 
 The shape that does work: first scrape on a new user runs the LLM to learn the
 IG DOM and emit per-surface JS scrapers. Subsequent scrapes call those scrapers
-directly — no LLM-per-turn. First scrape: 10 min, $4. Every scrape after: 30
-seconds, 10 cents. This is how Skyvern / Multi-on / Adept do it.
+directly — no LLM-per-turn. First scrape: 10 min. Every scrape after: 30
+seconds. This is how Skyvern / Multi-on / Adept do it.
 
-## Drop vision for the navigation loop
+## Vision for overlay text (status: DROPPED in DeepSeek swap)
 
-Each turn currently sends a 2500×1340 screenshot to Sonnet (~2k tokens). Setting
-`use_vision=False` in browser-use would drop that — ~70% input-token reduction,
-~2x faster per turn. Trade-off: lose ability to read text burned into reel video
-overlays.
-
-A hybrid would be: text-only by default, agent calls a `take_screenshot` action
-only when it specifically needs to read overlay text.
-
-## Switch to Haiku 4.5 for the agent driver
-
-Currently using Sonnet 4.6 ($3/M input, $15/M output). Haiku 4.5 ($1/M input,
-$5/M output) is ~3× cheaper and noticeably faster per call. Less reliable on
-multi-step navigation but for IG specifically — once the prompt is well-tuned —
-should be fine.
-
-Analysis (`analyze.py`) should stay on Sonnet since it's only 1-2 calls per
-compatibility check and quality matters.
+The prior Claude version had a `screenshot` tool so the model could read text
+burned into reel video overlays. `deepseek-chat` is text-only, so the tool was
+removed entirely in the DeepSeek swap. Net effect: ~70% input-token reduction
+per turn, faster nav, but anything burned into a video frame (overlay audio
+names, in-video captions) is no longer readable. If this matters more than the
+cost win, options are: route screenshot turns through a vision-capable model
+(e.g. an OpenAI-compatible vision endpoint), or switch the whole agent driver
+to a vision-capable model.
 
 ## Kuri migration (status: DONE, this branch)
 
@@ -77,8 +69,9 @@ nav 502s prove unrecoverable. When the binary lands, the install script
 picks it up automatically.
 
 Win realized: dropped Playwright + browser-use entirely; the scrape now runs
-on a custom Claude tool-use loop against kuri's compact a11y snapshots. Token
-budget per turn is ~half what browser-use was sending.
+on a custom DeepSeek tool-use loop (OpenAI-compatible API) against kuri's
+compact a11y snapshots. Token budget per turn is ~half what browser-use was
+sending.
 
 ## Instagrapi / network interception as a backend fallback
 

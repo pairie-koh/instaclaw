@@ -7,21 +7,20 @@ the partial file on disk still has everything collected so far. Public surface
 is preserved so analyze.py / server.py / render.py work unchanged.
 
 Engine: kuri (https://github.com/justrach/kuri) v0.4.5+ drives Chrome over CDP
-via its HTTP API; Claude (Sonnet 4.6) issues tool calls in a loop. Kuri's
-v0.4.5 auto-recovers the CDP session after Chrome's renderer swap on Instagram
+via its HTTP API; DeepSeek issues tool calls in a loop. Kuri's v0.4.5
+auto-recovers the CDP session after Chrome's renderer swap on Instagram
 (see kuri#172) so the loop stays alive across navigations.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from anthropic import Anthropic
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from kuri_client import Kuri, KuriError, KuriTab
@@ -33,9 +32,16 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = os.environ.get("INSTACLAW_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek-v4-flash")
 LLM_TIMEOUT_S = int(os.environ.get("INSTACLAW_LLM_TIMEOUT", "180"))
 MAX_TURNS = int(os.environ.get("INSTACLAW_MAX_TURNS", "60"))
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+
+
+def _client() -> OpenAI:
+    return OpenAI(base_url=DEEPSEEK_BASE_URL,
+                  api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+                  timeout=LLM_TIMEOUT_S)
 
 
 # ---------- output schema (matches the prior browser-use version) ----------
@@ -162,8 +168,9 @@ HARD RULES (apply to every step):
   preserved.
 - Use snap_interactive to see clickable elements with stable refs (e.g. e12),
   then click(ref). After a navigation or DOM mutation, snap again — refs change.
-- Use screenshot only when text/snapshot tools aren't enough (reel caption
-  overlays burned into video, audio names rendered as part of the visual UI).
+- Use snap_text and page_text for caption / comment / audio text. No vision is
+  available, so anything burned into a video frame (overlay text) cannot be
+  read — skip those and move on.
 """
 
 
@@ -249,171 +256,92 @@ Finish when done or by step 50. Everything is on disk via save_* calls.
 """
 
 
-# ---------- tool schema ----------
+# ---------- tool schema (OpenAI / DeepSeek function-calling format) ----------
+def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
 def _tools(mode: str) -> list[dict]:
     save_tools: list[dict] = [
-        {
-            "name": "save_header",
-            "description": "Save the profile header. Call once after extracting name/bio/stats.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "header_text": {"type": "string"},
-                    "stats_raw": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["name", "header_text", "stats_raw"],
-            },
-        },
-        {
-            "name": "mark_private",
-            "description": "Mark this target account as PRIVATE. Call only when the page shows the private wall and content is not visible.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "save_reel",
-            "description": "Save one repost from the Reposts tab. URL path like /p/ABC/ or /reel/XYZ/, caption, creator (especially the ORIGINAL poster for reposts), audio track name.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "caption": {"type": "string"},
-                    "creator": {"type": "string"},
-                    "audio": {"type": "string"},
-                },
-                "required": ["url", "caption", "creator", "audio"],
-            },
-        },
-        {
-            "name": "save_highlight",
-            "description": "Save one story highlight bubble after clicking through all its slides.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "cover_text": {"type": "string"},
-                    "slides": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["title", "cover_text", "slides"],
-            },
-        },
-        {
-            "name": "save_grid_post",
-            "description": "Save one grid post after opening it and reading caption + top comments + likes.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "caption": {"type": "string"},
-                    "comments": {"type": "array", "items": {"type": "string"}},
-                    "likes_raw": {"type": "string"},
-                },
-                "required": ["url", "caption", "comments", "likes_raw"],
-            },
-        },
-        {
-            "name": "save_tagged",
-            "description": "Save one tagged post URL. TARGET MODE only.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-        },
+        _fn("save_header",
+            "Save the profile header. Call once after extracting name/bio/stats.",
+            {"name": {"type": "string"},
+             "header_text": {"type": "string"},
+             "stats_raw": {"type": "array", "items": {"type": "string"}}},
+            ["name", "header_text", "stats_raw"]),
+        _fn("mark_private",
+            "Mark this target account as PRIVATE. Call only when the page shows the private wall and content is not visible.",
+            {}, []),
+        _fn("save_reel",
+            "Save one repost from the Reposts tab. URL path like /p/ABC/ or /reel/XYZ/, caption, creator (especially the ORIGINAL poster for reposts), audio track name.",
+            {"url": {"type": "string"},
+             "caption": {"type": "string"},
+             "creator": {"type": "string"},
+             "audio": {"type": "string"}},
+            ["url", "caption", "creator", "audio"]),
+        _fn("save_highlight",
+            "Save one story highlight bubble after clicking through all its slides.",
+            {"title": {"type": "string"},
+             "cover_text": {"type": "string"},
+             "slides": {"type": "array", "items": {"type": "string"}}},
+            ["title", "cover_text", "slides"]),
+        _fn("save_grid_post",
+            "Save one grid post after opening it and reading caption + top comments + likes.",
+            {"url": {"type": "string"},
+             "caption": {"type": "string"},
+             "comments": {"type": "array", "items": {"type": "string"}},
+             "likes_raw": {"type": "string"}},
+            ["url", "caption", "comments", "likes_raw"]),
+        _fn("save_tagged",
+            "Save one tagged post URL. TARGET MODE only.",
+            {"url": {"type": "string"}}, ["url"]),
     ]
     if mode == "self":
-        save_tools.append({
-            "name": "save_saved",
-            "description": "Save one saved post URL. SELF MODE only.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-        })
+        save_tools.append(_fn("save_saved",
+            "Save one saved post URL. SELF MODE only.",
+            {"url": {"type": "string"}}, ["url"]))
 
     browser_tools: list[dict] = [
-        {
-            "name": "navigate",
-            "description": "Navigate the current tab to a URL. Full https URLs.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-        },
-        {
-            "name": "snap_interactive",
-            "description": "Return interactive elements on the current page as a list of {ref, role, name}. Refs (e0, e1, ...) are stable until the DOM mutates.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "snap_text",
-            "description": "Return the full a11y tree as indented text. Use when you need non-interactive content like captions or comments.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "page_text",
-            "description": "Return all visible text on the page. Heavier than snap_text.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "click",
-            "description": "Click an element by its ref from snap_interactive.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"ref": {"type": "string"}},
-                "required": ["ref"],
-            },
-        },
-        {
-            "name": "type",
-            "description": "Type text into an input element identified by ref.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string"},
-                    "text": {"type": "string"},
-                    "submit": {"type": "boolean", "description": "Press Enter after typing"},
-                },
-                "required": ["ref", "text"],
-            },
-        },
-        {
-            "name": "scroll",
-            "description": "Scroll the page by dy pixels (positive = down).",
-            "input_schema": {
-                "type": "object",
-                "properties": {"dy": {"type": "integer"}},
-                "required": ["dy"],
-            },
-        },
-        {
-            "name": "back",
-            "description": "Browser back button.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "current_url",
-            "description": "Get the current page URL.",
-            "input_schema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "screenshot",
-            "description": "Take a screenshot of the current page and return it as a visible image. Use only when text tools aren't enough (reel caption overlays burned into video, audio overlays, photo content).",
-            "input_schema": {
-                "type": "object",
-                "properties": {"full_page": {"type": "boolean"}},
-            },
-        },
+        _fn("navigate", "Navigate the current tab to a URL. Full https URLs.",
+            {"url": {"type": "string"}}, ["url"]),
+        _fn("snap_interactive",
+            "Return interactive elements on the current page as a list of {ref, role, name}. Refs (e0, e1, ...) are stable until the DOM mutates.",
+            {}, []),
+        _fn("snap_text",
+            "Return the full a11y tree as indented text. Use when you need non-interactive content like captions or comments.",
+            {}, []),
+        _fn("page_text",
+            "Return all visible text on the page. Heavier than snap_text.",
+            {}, []),
+        _fn("click", "Click an element by its ref from snap_interactive.",
+            {"ref": {"type": "string"}}, ["ref"]),
+        _fn("type", "Type text into an input element identified by ref.",
+            {"ref": {"type": "string"},
+             "text": {"type": "string"},
+             "submit": {"type": "boolean", "description": "Press Enter after typing"}},
+            ["ref", "text"]),
+        _fn("scroll", "Scroll the page by dy pixels (positive = down).",
+            {"dy": {"type": "integer"}}, ["dy"]),
+        _fn("back", "Browser back button.", {}, []),
+        _fn("current_url", "Get the current page URL.", {}, []),
     ]
     return browser_tools + save_tools
 
 
 # ---------- tool dispatch ----------
-def _execute_tool(tab: KuriTab, store: CheckpointStore, name: str, args: dict) -> Any:
-    """Run a tool call. Returns either a string (text tool_result) or a list of
-    Anthropic content blocks (used for image responses from screenshot)."""
+def _execute_tool(tab: KuriTab, store: CheckpointStore, name: str, args: dict) -> str:
+    """Run a tool call. Returns a string for the tool_result content."""
     try:
         # ---- save_* (checkpoint to disk) ----
         if name == "save_header":
@@ -468,13 +396,6 @@ def _execute_tool(tab: KuriTab, store: CheckpointStore, name: str, args: dict) -
             return f"back -> {tab.url()}"
         if name == "current_url":
             return tab.url()
-        if name == "screenshot":
-            png = tab.screenshot(full_page=bool(args.get("full_page", False)))
-            return [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                              "data": base64.b64encode(png).decode("ascii")}},
-                {"type": "text", "text": f"screenshot of {tab.url()}"},
-            ]
         return f"unknown tool: {name}"
     except KuriError as e:
         return f"tool error: {e}"
@@ -488,6 +409,16 @@ def _short_args(d: dict) -> str:
     return s if len(s) < 80 else s[:77] + "..."
 
 
+def _parse_args(arg_str: str) -> dict:
+    """DeepSeek/OpenAI returns tool-call arguments as a JSON string. Parse defensively."""
+    if not arg_str:
+        return {}
+    try:
+        return json.loads(arg_str)
+    except json.JSONDecodeError:
+        return {}
+
+
 async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
     out_path = OUT_DIR / f"{mode}_{handle}.json"
     store = CheckpointStore(out_path, mode, handle)
@@ -499,19 +430,18 @@ async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> 
         raise KuriError(f"kuri not reachable (start it first): {e}") from e
 
     tools = _tools(mode)
-    client = Anthropic(timeout=LLM_TIMEOUT_S)
+    client = _client()
 
-    messages: list[dict] = [{"role": "user", "content": "Begin. Use the tools to complete the task above."}]
-    system = [
-        {"type": "text", "text": task, "cache_control": {"type": "ephemeral"}},
+    messages: list[dict] = [
+        {"role": "system", "content": task},
+        {"role": "user", "content": "Begin. Use the tools to complete the task above."},
     ]
 
     for step in range(1, MAX_TURNS + 1):
         try:
-            resp = client.messages.create(
+            resp = client.chat.completions.create(
                 model=MODEL,
                 max_tokens=4096,
-                system=system,
                 tools=tools,
                 messages=messages,
             )
@@ -519,11 +449,13 @@ async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> 
             print(f">>> [{step}] LLM call failed: {type(e).__name__}: {e}")
             break
 
-        thinking_chunks = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
-        thinking = "\n".join(thinking_chunks).strip()
-
-        tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
-        next_goal = ", ".join(f"{tu.name}({_short_args(tu.input or {})})" for tu in tool_uses) if tool_uses else ""
+        msg = resp.choices[0].message
+        thinking = (msg.content or "").strip()
+        tool_calls = msg.tool_calls or []
+        next_goal = ", ".join(
+            f"{tc.function.name}({_short_args(_parse_args(tc.function.arguments))})"
+            for tc in tool_calls
+        ) if tool_calls else ""
 
         if thinking or next_goal:
             print(f">>> [{step}] {thinking}".rstrip())
@@ -535,20 +467,28 @@ async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> 
                 except Exception as e:
                     print(f">>> [narrate-cb error] {e}")
 
-        messages.append({"role": "assistant", "content": resp.content})
+        # Append the assistant turn verbatim so the model sees its own tool_calls
+        # on the next round.
+        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name,
+                              "arguments": tc.function.arguments or "{}"}}
+                for tc in tool_calls
+            ]
+        messages.append(assistant_msg)
 
         # No tool calls = agent decided it's done.
-        if not tool_uses:
+        if not tool_calls:
             break
 
-        results: list[dict] = []
-        for tu in tool_uses:
-            out = _execute_tool(tab, store, tu.name, tu.input or {})
-            if isinstance(out, str) and len(out) > 8000:
+        for tc in tool_calls:
+            args = _parse_args(tc.function.arguments)
+            out = _execute_tool(tab, store, tc.function.name, args)
+            if len(out) > 8000:
                 out = out[:8000] + "\n... [truncated]"
-            results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
-
-        messages.append({"role": "user", "content": results})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
 
     # Whatever happened, the checkpoint file on disk is the canonical result.
     return json.loads(out_path.read_text(encoding="utf-8"))
@@ -577,7 +517,7 @@ def scrape_target(handle: str, narrate: NarrateCb = None) -> dict:
 
 # ---------- focused investigation used by the chat layer ----------
 async def focused_scrape(query: str, base_handle: str, narrate: NarrateCb = None) -> str:
-    """Open a kuri-driven Claude loop for a follow-up question. Returns prose evidence."""
+    """Open a kuri-driven DeepSeek loop for a follow-up question. Returns prose evidence."""
     task = f"""You are investigating Instagram for a follow-up question about @{base_handle}.
 
 QUESTION: {query}
@@ -597,31 +537,40 @@ what's visible.
 
     k = Kuri()
     tab = k.first_tab()
-    # Reuse the browser tool list (no save_* — this returns prose)
-    tools = [t for t in _tools("target") if not t["name"].startswith("save_") and t["name"] != "mark_private"]
-    client = Anthropic(timeout=LLM_TIMEOUT_S)
+    # Reuse the browser tool list (no save_* — this returns prose).
+    tools = [
+        t for t in _tools("target")
+        if not t["function"]["name"].startswith("save_")
+        and t["function"]["name"] != "mark_private"
+    ]
+    client = _client()
 
     # Throwaway store so _execute_tool's signature works; we never call save_*.
     store = CheckpointStore(OUT_DIR / f"_focused_{base_handle}.tmp.json", "target", base_handle)
 
-    messages: list[dict] = [{"role": "user", "content": "Begin investigating to answer the question above."}]
-    system = [{"type": "text", "text": task, "cache_control": {"type": "ephemeral"}}]
+    messages: list[dict] = [
+        {"role": "system", "content": task},
+        {"role": "user", "content": "Begin investigating to answer the question above."},
+    ]
 
     final_text = ""
     for step in range(1, MAX_TURNS + 1):
         try:
             resp = await asyncio.to_thread(
-                client.messages.create,
-                model=MODEL, max_tokens=4096, system=system, tools=tools, messages=messages,
+                client.chat.completions.create,
+                model=MODEL, max_tokens=4096, tools=tools, messages=messages,
             )
         except Exception as e:
             print(f">>> [focused {step}] LLM failed: {type(e).__name__}: {e}")
             break
 
-        thinking_chunks = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
-        text = "\n".join(thinking_chunks).strip()
-        tool_uses = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
-        next_goal = ", ".join(f"{tu.name}({_short_args(tu.input or {})})" for tu in tool_uses) if tool_uses else ""
+        msg = resp.choices[0].message
+        text = (msg.content or "").strip()
+        tool_calls = msg.tool_calls or []
+        next_goal = ", ".join(
+            f"{tc.function.name}({_short_args(_parse_args(tc.function.arguments))})"
+            for tc in tool_calls
+        ) if tool_calls else ""
 
         if text or next_goal:
             print(f">>> [focused {step}] {text}".rstrip())
@@ -633,18 +582,26 @@ what's visible.
                 except Exception:
                     pass
 
-        messages.append({"role": "assistant", "content": resp.content})
-        if not tool_uses:
+        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name,
+                              "arguments": tc.function.arguments or "{}"}}
+                for tc in tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        if not tool_calls:
             final_text = text
             break
 
-        results: list[dict] = []
-        for tu in tool_uses:
-            out = _execute_tool(tab, store, tu.name, tu.input or {})
-            if isinstance(out, str) and len(out) > 8000:
+        for tc in tool_calls:
+            args = _parse_args(tc.function.arguments)
+            out = _execute_tool(tab, store, tc.function.name, args)
+            if len(out) > 8000:
                 out = out[:8000] + "\n... [truncated]"
-            results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
-        messages.append({"role": "user", "content": results})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
 
     try:
         (OUT_DIR / f"_focused_{base_handle}.tmp.json").unlink(missing_ok=True)
