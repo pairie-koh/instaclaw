@@ -51,7 +51,7 @@ playwright install chromium || echo "WARNING: playwright install chromium failed
 if [ ! -f ".env" ]; then
     echo ""
     echo "No .env file found. Please paste your OpenRouter API key."
-    echo "(Grab one at https://openrouter.ai — single key routes to DeepSeek + Qwen-VL.)"
+    echo "(Grab one at https://openrouter.ai — single key, routes to MiMo-V2.5 for nav + vision.)"
     echo "It will be saved to .env in this folder."
     read -p "OPENROUTER_API_KEY: " APIKEY
     if [ -z "$APIKEY" ]; then

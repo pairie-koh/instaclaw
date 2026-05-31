@@ -7,11 +7,12 @@ the partial file on disk still has everything collected so far. Public surface
 is preserved so analyze.py / server.py / render.py work unchanged.
 
 Engine: kuri (https://github.com/justrach/kuri) v0.4.5+ drives Chrome over CDP
-via its HTTP API. The nav loop runs on a text LLM (DeepSeek V4-flash by default)
-via OpenRouter. The screenshot tool routes the captured PNG to a separate
-vision model (Qwen2.5-VL-72B by default), and returns the model's text
-description back to the nav loop — so the nav loop never sees raw images and
-stays cheap, while overlay text on reel video frames remains readable.
+via its HTTP API. Both the nav loop and the screenshot tool's vision side call
+run on Xiaomi MiMo-V2.5 (omnimodal — text agent + vision in one model) via
+OpenRouter. The screenshot tool captures a PNG, posts it to the same model in
+a separate single-shot call, and returns the text description back to the nav
+loop as the tool_result — keeps the nav loop's context lean while still
+letting overlay text on reel video frames be read on demand.
 """
 from __future__ import annotations
 
@@ -35,8 +36,7 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek/deepseek-v4-flash")
-VISION_MODEL = os.environ.get("INSTACLAW_VISION_MODEL", "qwen/qwen2.5-vl-72b-instruct")
+MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
 LLM_TIMEOUT_S = int(os.environ.get("INSTACLAW_LLM_TIMEOUT", "180"))
 MAX_TURNS = int(os.environ.get("INSTACLAW_MAX_TURNS", "60"))
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -49,12 +49,12 @@ def _client() -> OpenAI:
 
 
 def _describe_screenshot(png_bytes: bytes, current_url: str) -> str:
-    """Side call to a vision model. Returns a focused text description that the
-    text-only nav loop can consume as a tool_result string."""
+    """Side call to the omnimodal model with the captured PNG. Returns a focused
+    text description so the nav loop receives a string-shaped tool_result."""
     b64 = base64.b64encode(png_bytes).decode("ascii")
     try:
         resp = _client().chat.completions.create(
-            model=VISION_MODEL,
+            model=MODEL,
             max_tokens=800,
             messages=[{
                 "role": "user",
@@ -291,7 +291,7 @@ Finish when done or by step 50. Everything is on disk via save_* calls.
 """
 
 
-# ---------- tool schema (OpenAI / DeepSeek function-calling format) ----------
+# ---------- tool schema (OpenAI function-calling format) ----------
 def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
     return {
         "type": "function",
@@ -455,7 +455,7 @@ def _short_args(d: dict) -> str:
 
 
 def _parse_args(arg_str: str) -> dict:
-    """DeepSeek/OpenAI returns tool-call arguments as a JSON string. Parse defensively."""
+    """OpenAI-compatible APIs return tool-call arguments as a JSON string. Parse defensively."""
     if not arg_str:
         return {}
     try:
@@ -562,7 +562,7 @@ def scrape_target(handle: str, narrate: NarrateCb = None) -> dict:
 
 # ---------- focused investigation used by the chat layer ----------
 async def focused_scrape(query: str, base_handle: str, narrate: NarrateCb = None) -> str:
-    """Open a kuri-driven DeepSeek loop for a follow-up question. Returns prose evidence."""
+    """Open a kuri-driven MiMo loop for a follow-up question. Returns prose evidence."""
     task = f"""You are investigating Instagram for a follow-up question about @{base_handle}.
 
 QUESTION: {query}

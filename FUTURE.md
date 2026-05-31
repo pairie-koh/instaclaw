@@ -33,27 +33,26 @@ before adding another modal step.
 
 ## Faster scrape path (compile-once, replay)
 
-Each scrape is still an LLM-driven loop (~50 steps). On `deepseek-chat` the
-per-scrape cost is pennies, so the unit economics are no longer the blocker —
-latency is. Still useful to compile once and replay:
+Each scrape is still an LLM-driven loop (~50 steps). On `xiaomi/mimo-v2.5`
+the per-scrape cost is pennies, so the unit economics are no longer the
+blocker — latency is. Still useful to compile once and replay:
 
 The shape that does work: first scrape on a new user runs the LLM to learn the
 IG DOM and emit per-surface JS scrapers. Subsequent scrapes call those scrapers
 directly — no LLM-per-turn. First scrape: 10 min. Every scrape after: 30
 seconds. This is how Skyvern / Multi-on / Adept do it.
 
-## Vision for overlay text (status: REROUTED via Qwen-VL)
+## Vision for overlay text (status: HANDLED by MiMo-V2.5)
 
-The prior Claude version had a `screenshot` tool that returned an image
-content block to Claude directly. DeepSeek V4-flash is text-only, so an
-intermediate vision call is now in the loop: when the nav model calls
-`screenshot`, kuri captures the PNG, `_describe_screenshot` posts it to
-Qwen2.5-VL-72B (via OpenRouter), and the vision model's text description
-is returned to the nav loop as the tool_result string. The nav model
-never sees the raw image. Cost is ~$0.001 per screenshot call, so even
-heavy use stays well under a cent per scrape. Override
-`INSTACLAW_VISION_MODEL` to swap the vision route (GLM-4.5V,
-gpt-4o-mini, etc.).
+MiMo-V2.5 is natively omnimodal, so the `screenshot` tool no longer needs a
+separate model — the side call goes back to MiMo with `image_url` input and
+returns text the nav loop can consume as a string tool_result. The reason the
+two-step (capture PNG → separate call → text back to loop) shape is still
+there at all is OpenAI-spec: tool result messages must be string, not image
+content. Cost is dominated by the agentic loop; per-screenshot cost is
+fractions of a cent at MiMo pricing. If you want to swap to a different
+omnimodal model later, change `INSTACLAW_MODEL` — the screenshot side call
+uses the same env var.
 
 ## Kuri migration (status: DONE, this branch)
 
@@ -71,9 +70,10 @@ nav 502s prove unrecoverable. When the binary lands, the install script
 picks it up automatically.
 
 Win realized: dropped Playwright + browser-use entirely; the scrape now runs
-on a custom DeepSeek tool-use loop (OpenRouter-routed, OpenAI-compatible API)
-against kuri's compact a11y snapshots, with Qwen-VL handling screenshot turns.
-Token budget per turn is ~half what browser-use was sending.
+on a custom MiMo-V2.5 tool-use loop (OpenRouter-routed, OpenAI-compatible API)
+against kuri's compact a11y snapshots, with the same model handling screenshot
+turns via image input. Token budget per turn is ~half what browser-use was
+sending.
 
 ## Instagrapi / network interception as a backend fallback
 

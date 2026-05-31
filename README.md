@@ -10,7 +10,7 @@ Runs on [kuri](https://github.com/justrach/kuri) (v0.4.5+).
 
 Two modes:
 
-- **Aura readout** (self) — DeepSeek reads your Reposts tab, story highlights,
+- **Aura readout** (self) — MiMo reads your Reposts tab, story highlights,
   grid, and bio, and writes you a readout in the voice of a friend who's
   been paying attention. Headline, taste cluster, friend-group role, what
   you actually project. The kind of thing you screenshot to the group chat.
@@ -31,22 +31,23 @@ query and answers with cited evidence.
 ```
 your browser  →  uvicorn (localhost:8000)
                      |
-                     ├─ /scrape  →  DeepSeek V4-flash tool-use loop  ─┐
-                     |                  ↓ (navigate / snap / click /  │  (all via
-                     |                     screenshot / save_*)        │   OpenRouter)
-                     |               kuri_client  →  HTTP  →  kuri    │
-                     |                                          ↓     │
+                     ├─ /scrape  →  MiMo-V2.5 tool-use loop  ─────┐
+                     |                  ↓ (navigate / snap /     │  (all via
+                     |                     click / screenshot /  │   OpenRouter)
+                     |                     save_*)               │
+                     |               kuri_client  →  HTTP  →  kuri server (WSL)
+                     |                                          ↓
                      |                                       Chrome  →  instagram.com
                      |                                                 │
-                     |     screenshot →  Qwen2.5-VL-72B  ──── returns ─┤  (only on
-                     |                                       text desc │   screenshot
-                     |                                       to loop   │   turns)
+                     |     screenshot →  MiMo-V2.5 (image input)  ────┤  (side call
+                     |                       returns text description │   on screenshot
+                     |                       to nav loop              │   turns only)
                      |                                                 │
-                     ├─ analyze.py  →  DeepSeek V4-flash (JSON mode)  ─┤
-                     |                  (aura for self, vibe for target │
-                     |                   with cached self as context)  │
+                     ├─ analyze.py  →  MiMo-V2.5 (JSON mode)  ────────┤
+                     |                  (aura for self, vibe for target
+                     |                   with cached self as context) │
                      |                                                 │
-                     └─ /chat  →  DeepSeek V4-flash tool-use loop with ─┘
+                     └─ /chat  →  MiMo-V2.5 tool-use loop with ───────┘
                                   fetch_more tool, fetch_more kicks off
                                   focused_scrape (another kuri-driven
                                   loop returning prose evidence)
@@ -54,18 +55,16 @@ your browser  →  uvicorn (localhost:8000)
 
 Kuri runs in WSL on Windows and natively on macOS / Linux. It exposes
 Chrome's CDP via an HTTP API and serves compact a11y snapshots that the
-nav loop uses by default. The DeepSeek tool loop has browser tools
-(`navigate`, `snap_interactive`, `snap_text`, `page_text`, `click`,
-`type`, `scroll`, `back`, `current_url`, `screenshot`) and `save_*` tools
-(`save_reel`, `save_highlight`, `save_grid_post`, `save_header`, etc.) —
-each `save_*` writes the in-progress scrape JSON to disk immediately, so
-if the loop dies the file already contains everything collected so far.
-The `screenshot` tool captures a PNG and routes it through a separate
-Qwen2.5-VL-72B call; the vision model's text description is returned to
-the nav loop as the tool result. This keeps the 60-turn nav loop on a
-cheap text model while still allowing overlay text on reel video frames
-to be read on demand. Both models are accessed through OpenRouter — one
-API key, one base URL.
+nav loop uses by default. The MiMo tool loop has browser tools (`navigate`,
+`snap_interactive`, `snap_text`, `page_text`, `click`, `type`, `scroll`,
+`back`, `current_url`, `screenshot`) and `save_*` tools (`save_reel`,
+`save_highlight`, `save_grid_post`, `save_header`, etc.) — each `save_*`
+writes the in-progress scrape JSON to disk immediately, so if the loop
+dies the file already contains everything collected so far. MiMo-V2.5 is
+natively omnimodal, but OpenAI-compatible tool results must be strings —
+so the `screenshot` tool captures a PNG, posts it back to MiMo in a
+separate single-shot call with `image_url` input, and returns the model's
+text description to the nav loop. One model, one API key, one base URL.
 
 Output is HTML rendered server-side and served into an iframe on the
 single-page frontend. SSE streams the agent's live narration so you can
@@ -84,8 +83,8 @@ The script will check WSL is available, create a Python `.venv`, pip-install
 requirements, install Google Chrome inside WSL (for kuri's managed browser),
 install kuri via its `install.sh`, and prompt for your `OPENROUTER_API_KEY`
 which gets stored in `.env`. A `KURI_API_TOKEN` is also generated.
-(One OpenRouter key routes to both DeepSeek for the nav loop and Qwen-VL
-for screenshot turns — no second key needed.)
+(One OpenRouter key routes to MiMo-V2.5 for both the nav loop and
+screenshot turns — no second key needed.)
 
 Note: at time of writing, kuri's stable install channel ships v0.4.4, but
 the IG CDP fix landed in v0.4.5 (issue #172 / commit `648fe344`). If you see
@@ -120,22 +119,23 @@ compare against. Then:
 - Type any handle in the main input + click **Vibe check** to get a
   compatibility readout (it uses your cached aura as the reference).
 
-A full scrape runs about 25-35 minutes per profile (DeepSeek driving the
+A full scrape runs about 25-35 minutes per profile (MiMo driving the
 browser through ~20 reposts, 5 highlights, 5 grid posts, header). Cost is
-typically well under 5 cents per scrape — pennies on `deepseek-v4-flash`
-for the nav loop plus ~$0.001 per `screenshot` turn through Qwen-VL.
-Roughly an order of magnitude cheaper than the prior Sonnet 4.6 setup.
+typically well under 5 cents per scrape on `xiaomi/mimo-v2.5` ($0.14/M
+input, $0.28/M output) — roughly an order of magnitude cheaper than the
+prior Sonnet 4.6 setup.
 
 ## Architecture
 
 - `server.py` — FastAPI app, SSE streaming, SQLite job persistence
-- `agent_scrape.py` — DeepSeek tool-use loop (OpenRouter-routed,
+- `agent_scrape.py` — MiMo-V2.5 tool-use loop (OpenRouter-routed,
   OpenAI-compatible API), custom save_* tools, screenshot tool via side
-  call to Qwen-VL, task prompts for self vs target, driven through kuri
+  call to MiMo with image input, task prompts for self vs target, driven
+  through kuri
 - `kuri_client.py` — thin HTTP wrapper around kuri (kuri runs in WSL,
   client talks to localhost:8080)
-- `analyze.py` — aura / vibe prompts + analyze functions (DeepSeek JSON mode
-  via OpenRouter)
+- `analyze.py` — aura / vibe prompts + analyze functions (MiMo-V2.5 JSON
+  mode via OpenRouter)
 - `render.py` — HTML card rendering with markdown-bold support
 - `screenshot.py` — chromium CLI screenshot for sharing cards as PNGs
 - `static/index.html` — single-page frontend (no framework)
@@ -149,16 +149,15 @@ which is how the IG login carries over between runs.
 
 `.env`:
 
-- `OPENROUTER_API_KEY` — required. Grab one at https://openrouter.ai. Routes
-  to both the nav-loop model and the vision model through one key.
-- `INSTACLAW_MODEL` — nav-loop model. Defaults to `deepseek/deepseek-v4-flash`.
-  Other plausible picks via OpenRouter: `moonshotai/kimi-k2` (stronger
-  agentic tool-use, slightly pricier), `deepseek/deepseek-v4-pro` (too slow
-  for a 60-turn loop, listed for completeness).
-- `INSTACLAW_VISION_MODEL` — model the `screenshot` tool routes through.
-  Defaults to `qwen/qwen2.5-vl-72b-instruct`. Other picks:
-  `zhipuai/glm-4.5v`, `openai/gpt-4o-mini` (English-leaning, slightly
-  pricier).
+- `OPENROUTER_API_KEY` — required. Grab one at https://openrouter.ai. Drives
+  both the nav loop and the screenshot tool's vision side call through MiMo.
+- `INSTACLAW_MODEL` — model used for everything (nav loop, analyze, chat,
+  screenshot side call). Defaults to `xiaomi/mimo-v2.5`. Alternates worth
+  trying via OpenRouter: `xiaomi/mimo-v2.5-pro` (stronger, ~3× the price),
+  `deepseek/deepseek-v4-flash` (text-only — would need a separate vision
+  route for the screenshot tool), `moonshotai/kimi-k2` (text-only, same
+  caveat). The screenshot tool requires the model to accept `image_url`
+  input.
 - `INSTACLAW_MAX_TURNS` — agent loop step ceiling. Default 60.
 - `INSTACLAW_LLM_TIMEOUT` — LLM client timeout in seconds. Default 180.
 - `OPENROUTER_BASE_URL` — defaults to `https://openrouter.ai/api/v1`.

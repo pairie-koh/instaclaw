@@ -33,7 +33,7 @@ OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
 STATIC_DIR = ROOT / "static"
 DB_PATH = OUT_DIR / "instaclaw.db"
-MODEL = os.environ.get("INSTACLAW_MODEL", "deepseek/deepseek-v4-flash")
+MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
 
 llm_client = OpenAI(
     base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
@@ -463,7 +463,7 @@ Rules:
 
 
 async def _chat_stream(body: ChatBody, request: Request):
-    """SSE generator implementing the DeepSeek tool-use loop."""
+    """SSE generator implementing the MiMo tool-use loop."""
     job_row = await db_load_job(body.job_id)
     if job_row is None and body.job_id in JOBS:
         job_row = _job_to_response(JOBS[body.job_id])
