@@ -33,7 +33,7 @@ before adding another modal step.
 
 ## Faster scrape path (compile-once, replay)
 
-Each scrape is still an LLM-driven loop (~50 steps). On `xiaomi/mimo-v2.5`
+Each scrape is still an LLM-driven loop (~50 steps). On `mimo-v2.5`
 the per-scrape cost is pennies, so the unit economics are no longer the
 blocker — latency is. Still useful to compile once and replay:
 
@@ -70,7 +70,7 @@ nav 502s prove unrecoverable. When the binary lands, the install script
 picks it up automatically.
 
 Win realized: dropped Playwright + browser-use entirely; the scrape now runs
-on a custom MiMo-V2.5 tool-use loop (OpenRouter-routed, OpenAI-compatible API)
+on a custom MiMo-V2.5 tool-use loop (codegraff-routed, OpenAI-compatible API)
 against kuri's compact a11y snapshots, with the same model handling screenshot
 turns via image input. Token budget per turn is ~half what browser-use was
 sending.

@@ -14,7 +14,7 @@ if [ -f ".env" ]; then
     source .env
     set +a
 else
-    echo "WARNING: .env not found. Server will start but OpenRouter calls will fail."
+    echo "WARNING: .env not found. Server will start but codegraff calls will fail."
 fi
 
 (sleep 2 && open http://localhost:8000) &

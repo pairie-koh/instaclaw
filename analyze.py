@@ -5,10 +5,11 @@ import re
 from pathlib import Path
 from openai import OpenAI
 
-MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
+MODEL = os.environ.get("INSTACLAW_MODEL", "mimo-v2.5")
+MAX_TOKENS = int(os.environ.get("INSTACLAW_MAX_TOKENS", "24000"))
 client = OpenAI(
-    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+    base_url=os.environ.get("CODEGRAFF_BASE_URL", "https://gateway.codegraff.com/v1"),
+    api_key=os.environ.get("CODEGRAFF_API_KEY") or os.environ.get("CG_API_KEY", ""),
 )
 
 # Few-shot anchors used by both prompts to calibrate "specific" vs "generic".
@@ -135,7 +136,7 @@ def _extract_json(text: str) -> dict:
 def aura(self_data: dict) -> dict:
     resp = client.chat.completions.create(
         model=MODEL,
-        max_tokens=4000,
+        max_tokens=MAX_TOKENS,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_AURA},
@@ -150,7 +151,7 @@ def vibe(self_data: dict, target_data: dict, self_aura: dict | None = None) -> d
     self_summary = json.dumps(self_aura, ensure_ascii=False) if self_aura else "(no prior aura — derive briefly from the self scrape data below)"
     resp = client.chat.completions.create(
         model=MODEL,
-        max_tokens=4000,
+        max_tokens=MAX_TOKENS,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_VIBE},

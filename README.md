@@ -33,7 +33,7 @@ your browser  →  uvicorn (localhost:8000)
                      |
                      ├─ /scrape  →  MiMo-V2.5 tool-use loop  ─────┐
                      |                  ↓ (navigate / snap /     │  (all via
-                     |                     click / screenshot /  │   OpenRouter)
+                     |                     click / screenshot /  │   codegraff)
                      |                     save_*)               │
                      |               kuri_client  →  HTTP  →  kuri server (WSL)
                      |                                          ↓
@@ -66,6 +66,11 @@ so the `screenshot` tool captures a PNG, posts it back to MiMo in a
 separate single-shot call with `image_url` input, and returns the model's
 text description to the nav loop. One model, one API key, one base URL.
 
+The whole stack talks to MiMo-V2.5 through codegraff's OpenAI-compatible
+gateway (`https://gateway.codegraff.com/v1`), so it stays a standard
+`openai`-SDK app — only the base URL, key, and model alias point at
+codegraff.
+
 Output is HTML rendered server-side and served into an iframe on the
 single-page frontend. SSE streams the agent's live narration so you can
 watch it think.
@@ -81,9 +86,9 @@ setup.bat
 This requires WSL2 with an Ubuntu distro (kuri only ships Linux binaries).
 The script will check WSL is available, create a Python `.venv`, pip-install
 requirements, install Google Chrome inside WSL (for kuri's managed browser),
-install kuri via its `install.sh`, and prompt for your `OPENROUTER_API_KEY`
+install kuri via its `install.sh`, and prompt for your `CODEGRAFF_API_KEY`
 which gets stored in `.env`. A `KURI_API_TOKEN` is also generated.
-(One OpenRouter key routes to MiMo-V2.5 for both the nav loop and
+(One codegraff key routes to MiMo-V2.5 for both the nav loop and
 screenshot turns — no second key needed.)
 
 Note: at time of writing, kuri's stable install channel ships v0.4.4, but
@@ -121,21 +126,21 @@ compare against. Then:
 
 A full scrape runs about 25-35 minutes per profile (MiMo driving the
 browser through ~20 reposts, 5 highlights, 5 grid posts, header). Cost is
-typically well under 5 cents per scrape on `xiaomi/mimo-v2.5` ($0.14/M
-input, $0.28/M output) — roughly an order of magnitude cheaper than the
-prior Sonnet 4.6 setup.
+typically a few cents per scrape on `mimo-v2.5` (MiMo-V2.5, routed through
+the codegraff gateway) — far cheaper than a frontier model would be for the
+same loop. See https://codegraff.com/docs/models for current gateway pricing.
 
 ## Architecture
 
 - `server.py` — FastAPI app, SSE streaming, SQLite job persistence
-- `agent_scrape.py` — MiMo-V2.5 tool-use loop (OpenRouter-routed,
+- `agent_scrape.py` — MiMo-V2.5 tool-use loop (codegraff-routed,
   OpenAI-compatible API), custom save_* tools, screenshot tool via side
   call to MiMo with image input, task prompts for self vs target, driven
   through kuri
 - `kuri_client.py` — thin HTTP wrapper around kuri (kuri runs in WSL,
   client talks to localhost:8080)
 - `analyze.py` — aura / vibe prompts + analyze functions (MiMo-V2.5 JSON
-  mode via OpenRouter)
+  mode via the codegraff gateway)
 - `render.py` — HTML card rendering with markdown-bold support
 - `screenshot.py` — chromium CLI screenshot for sharing cards as PNGs
 - `static/index.html` — single-page frontend (no framework)
@@ -149,19 +154,24 @@ which is how the IG login carries over between runs.
 
 `.env`:
 
-- `OPENROUTER_API_KEY` — required. Grab one at https://openrouter.ai. Drives
-  both the nav loop and the screenshot tool's vision side call through MiMo.
+- `CODEGRAFF_API_KEY` — required. A `cg_sk_` key from
+  https://codegraff.com/dashboard/keys. Drives both the nav loop and the
+  screenshot tool's vision side call through MiMo. (`CG_API_KEY` also works.)
 - `INSTACLAW_MODEL` — model used for everything (nav loop, analyze, chat,
-  screenshot side call). Defaults to `xiaomi/mimo-v2.5`. Alternates worth
-  trying via OpenRouter: `xiaomi/mimo-v2.5-pro` (stronger, ~3× the price),
-  `deepseek/deepseek-v4-flash` (text-only — would need a separate vision
-  route for the screenshot tool), `moonshotai/kimi-k2` (text-only, same
-  caveat). The screenshot tool requires the model to accept `image_url`
-  input.
+  screenshot side call). Defaults to `mimo-v2.5`, the only codegraff alias
+  that accepts image input (`input_modalities: ["text", "image"]`) — the
+  screenshot vision tool needs it. The other aliases (`mimo-v2.5-pro`,
+  `deepseek-v4-pro`, `kimi-k2.6`, `gpt-5.5`, `grok-build`) are text-only on
+  the gateway, so switching to one would need a separate vision route for the
+  screenshot path. See https://codegraff.com/docs/models.
+- `INSTACLAW_MAX_TOKENS` — max_tokens per LLM call. Default 24000. `mimo-v2.5`
+  is a reasoning model (it spends tokens thinking before answering), so the
+  cap must be generous or `content` comes back empty. Lower it only if you
+  switch to a non-reasoning model.
 - `INSTACLAW_MAX_TURNS` — agent loop step ceiling. Default 60.
 - `INSTACLAW_LLM_TIMEOUT` — LLM client timeout in seconds. Default 180.
-- `OPENROUTER_BASE_URL` — defaults to `https://openrouter.ai/api/v1`.
-  Override to point at any OpenAI-compatible endpoint.
+- `CODEGRAFF_BASE_URL` — defaults to `https://gateway.codegraff.com/v1`.
+  Override to point at any OpenAI-compatible endpoint (must include `/v1`).
 - `KURI_API_TOKEN` — bearer token for the local kuri server. Auto-generated
   by `setup.bat`.
 - `KURI_BASE_URL` — defaults to `http://127.0.0.1:8080`. Override if you're

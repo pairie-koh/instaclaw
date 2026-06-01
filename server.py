@@ -33,11 +33,12 @@ OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
 STATIC_DIR = ROOT / "static"
 DB_PATH = OUT_DIR / "instaclaw.db"
-MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
+MODEL = os.environ.get("INSTACLAW_MODEL", "mimo-v2.5")
+MAX_TOKENS = int(os.environ.get("INSTACLAW_MAX_TOKENS", "24000"))
 
 llm_client = OpenAI(
-    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+    base_url=os.environ.get("CODEGRAFF_BASE_URL", "https://gateway.codegraff.com/v1"),
+    api_key=os.environ.get("CODEGRAFF_API_KEY") or os.environ.get("CG_API_KEY", ""),
 )
 
 
@@ -493,7 +494,7 @@ async def _chat_stream(body: ChatBody, request: Request):
 
         resp = await asyncio.to_thread(
             llm_client.chat.completions.create,
-            model=MODEL, max_tokens=1500,
+            model=MODEL, max_tokens=MAX_TOKENS,
             tools=[CHAT_TOOL], messages=messages,
         )
         msg = resp.choices[0].message

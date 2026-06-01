@@ -9,7 +9,7 @@ is preserved so analyze.py / server.py / render.py work unchanged.
 Engine: kuri (https://github.com/justrach/kuri) v0.4.5+ drives Chrome over CDP
 via its HTTP API. Both the nav loop and the screenshot tool's vision side call
 run on Xiaomi MiMo-V2.5 (omnimodal — text agent + vision in one model) via
-OpenRouter. The screenshot tool captures a PNG, posts it to the same model in
+the codegraff gateway. The screenshot tool captures a PNG, posts it to the same model in
 a separate single-shot call, and returns the text description back to the nav
 loop as the tool_result — keeps the nav loop's context lean while still
 letting overlay text on reel video frames be read on demand.
@@ -36,15 +36,19 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
+MODEL = os.environ.get("INSTACLAW_MODEL", "mimo-v2.5")
 LLM_TIMEOUT_S = int(os.environ.get("INSTACLAW_LLM_TIMEOUT", "180"))
 MAX_TURNS = int(os.environ.get("INSTACLAW_MAX_TURNS", "60"))
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# mimo-v2.5 is a reasoning model: it spends tokens thinking before emitting
+# content, so the cap must leave room for reasoning + the answer. Too low and
+# `content` comes back empty. Tune down only if you swap to a non-reasoning model.
+MAX_TOKENS = int(os.environ.get("INSTACLAW_MAX_TOKENS", "24000"))
+CODEGRAFF_BASE_URL = os.environ.get("CODEGRAFF_BASE_URL", "https://gateway.codegraff.com/v1")
 
 
 def _client() -> OpenAI:
-    return OpenAI(base_url=OPENROUTER_BASE_URL,
-                  api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+    return OpenAI(base_url=CODEGRAFF_BASE_URL,
+                  api_key=os.environ.get("CODEGRAFF_API_KEY") or os.environ.get("CG_API_KEY", ""),
                   timeout=LLM_TIMEOUT_S)
 
 
@@ -55,7 +59,7 @@ def _describe_screenshot(png_bytes: bytes, current_url: str) -> str:
     try:
         resp = _client().chat.completions.create(
             model=MODEL,
-            max_tokens=800,
+            max_tokens=MAX_TOKENS,
             messages=[{
                 "role": "user",
                 "content": [
@@ -486,7 +490,7 @@ async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> 
         try:
             resp = client.chat.completions.create(
                 model=MODEL,
-                max_tokens=4096,
+                max_tokens=MAX_TOKENS,
                 tools=tools,
                 messages=messages,
             )
@@ -603,7 +607,7 @@ what's visible.
         try:
             resp = await asyncio.to_thread(
                 client.chat.completions.create,
-                model=MODEL, max_tokens=4096, tools=tools, messages=messages,
+                model=MODEL, max_tokens=MAX_TOKENS, tools=tools, messages=messages,
             )
         except Exception as e:
             print(f">>> [focused {step}] LLM failed: {type(e).__name__}: {e}")
