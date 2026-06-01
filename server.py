@@ -16,7 +16,7 @@ from typing import Optional
 import os
 
 import aiosqlite
-from openai import OpenAI
+import cg_agent
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,12 +33,6 @@ OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
 STATIC_DIR = ROOT / "static"
 DB_PATH = OUT_DIR / "instaclaw.db"
-MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
-
-llm_client = OpenAI(
-    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-)
 
 
 # ---------- job state (in-memory) ----------
@@ -410,20 +404,6 @@ class ChatBody(BaseModel):
     self_pronouns: Optional[str] = None
 
 
-CHAT_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "fetch_more",
-        "description": "Investigate the target's IG further to find specific evidence for the user's question. Use sparingly — only when the cached scrape and readout don't already answer it.",
-        "parameters": {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        },
-    },
-}
-
-
 def _chat_system(job: dict, target_pronouns: Optional[str] = None,
                  self_pronouns: Optional[str] = None) -> str:
     kind = job["kind"]
@@ -453,8 +433,8 @@ PRIOR READOUT YOU WROTE:
 Rules:
 - Answer from the cached data when possible. Be specific, cite captions, comments, reels, audio.
 - If the answer truly requires fresh IG browsing (e.g. "who's that person in their stories",
-  "what's @x's deal", "are they at the same event as @y"), call the `fetch_more` tool with a
-  focused query. Don't call it for things you can already answer.
+  "what's @x's deal", "are they at the same event as @y"), use the kuri browser tools to
+  investigate. Don't browse for things you can already answer from the cache above.
 - Tone matches the readout: observational, specific, faintly funny. Never mean.
 - Keep replies under ~200 words unless the user asks for more.
 - NEVER use em-dashes (—) or en-dashes (–). Use periods, commas, parentheses, colons, or line breaks instead.
@@ -463,7 +443,8 @@ Rules:
 
 
 async def _chat_stream(body: ChatBody, request: Request):
-    """SSE generator implementing the MiMo tool-use loop."""
+    """SSE generator: the forge agent answers from the cached scrape/readout and
+    can browse the target's IG via the kuri MCP tools when it needs fresh data."""
     job_row = await db_load_job(body.job_id)
     if job_row is None and body.job_id in JOBS:
         job_row = _job_to_response(JOBS[body.job_id])
@@ -472,88 +453,45 @@ async def _chat_stream(body: ChatBody, request: Request):
         yield sse({"type": "done"})
         return
 
-    handle = job_row["handle"]
     system = _chat_system(job_row, target_pronouns=body.target_pronouns,
                           self_pronouns=body.self_pronouns)
-
-    # Build messages: system + prior conversation + this user message
     history = await db_load_chat(body.job_id)
-    messages: list[dict] = [{"role": "system", "content": system}]
-    messages.extend({"role": m["role"], "content": m["content"]} for m in history)
-    messages.append({"role": "user", "content": body.message})
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in history)
     await db_save_chat(body.job_id, "user", body.message)
 
-    final_text = ""
-    evidence_collected: list[str] = []
+    prompt = (
+        system
+        + (f"\n\nCONVERSATION SO FAR:\n{convo}" if convo else "")
+        + f"\n\nUSER'S NEW MESSAGE:\n{body.message}\n\n"
+        + "Reply now. Answer from the cached scrape and readout above when you can. "
+        + "Only if you genuinely need fresh data should you use the kuri browser tools "
+        + "to investigate the target's Instagram."
+    )
 
-    for _ in range(4):  # tool-use loop, capped
+    loop = asyncio.get_event_loop()
+    narration_q: asyncio.Queue = asyncio.Queue()
+
+    def narrate_cb(step: int, thinking: str, next_goal: str, lp=loop, q=narration_q):
+        asyncio.run_coroutine_threadsafe(
+            q.put({"type": "narration", "step": step,
+                   "thinking": thinking, "next_goal": next_goal}), lp)
+
+    yield sse({"type": "thinking", "content": "thinking..."})
+    task = asyncio.create_task(asyncio.to_thread(cg_agent.run, prompt, narrate_cb))
+    while not task.done():
+        try:
+            yield sse(await asyncio.wait_for(narration_q.get(), timeout=1.0))
+        except asyncio.TimeoutError:
+            pass
         if await request.is_disconnected():
+            task.cancel()
             return
-        yield sse({"type": "thinking", "content": "thinking..."})
+    while not narration_q.empty():
+        yield sse(narration_q.get_nowait())
 
-        resp = await asyncio.to_thread(
-            llm_client.chat.completions.create,
-            model=MODEL, max_tokens=1500,
-            tools=[CHAT_TOOL], messages=messages,
-        )
-        msg = resp.choices[0].message
-        tool_calls = msg.tool_calls or []
-        text = (msg.content or "").strip()
-
-        if not tool_calls:
-            final_text = text
-            messages.append({"role": "assistant", "content": msg.content or ""})
-            break
-
-        if text:
-            yield sse({"type": "thinking", "content": text})
-
-        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        assistant_msg["tool_calls"] = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name,
-                          "arguments": tc.function.arguments or "{}"}}
-            for tc in tool_calls
-        ]
-        messages.append(assistant_msg)
-
-        for tc in tool_calls:
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            query = args.get("query", "")
-            yield sse({"type": "fetching", "query": query})
-
-            loop = asyncio.get_event_loop()
-            narration_q: asyncio.Queue = asyncio.Queue()
-
-            def narrate_cb(step: int, thinking: str, next_goal: str, lp=loop, q=narration_q):
-                asyncio.run_coroutine_threadsafe(
-                    q.put({"type": "narration", "step": step,
-                           "thinking": thinking, "next_goal": next_goal}), lp)
-
-            scrape_task = asyncio.create_task(
-                agent_scrape.focused_scrape(query, handle, narrate=narrate_cb))
-            while not scrape_task.done():
-                try:
-                    yield sse(await asyncio.wait_for(narration_q.get(), timeout=1.0))
-                except asyncio.TimeoutError:
-                    pass
-                if await request.is_disconnected():
-                    scrape_task.cancel()
-                    return
-
-            evidence = await scrape_task
-            evidence_collected.append(evidence)
-            yield sse({"type": "evidence", "content": evidence})
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": evidence})
-
-    if not final_text:
-        final_text = "(no reply)"
+    final_text = (await task) or "(no reply)"
     yield sse({"type": "message", "content": final_text})
-    await db_save_chat(body.job_id, "assistant", final_text,
-                       evidence="\n---\n".join(evidence_collected) or None)
+    await db_save_chat(body.job_id, "assistant", final_text)
     yield sse({"type": "done"})
 
 

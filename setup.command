@@ -2,62 +2,59 @@
 cd "$(dirname "$0")"
 set -e
 
-echo "=== instaclaw setup ==="
+echo "=== instaclaw setup (codegraff SDK) ==="
 
-# Check python3
-if ! command -v python3 >/dev/null 2>&1; then
-    echo ""
-    echo "ERROR: python3 is not installed."
-    echo "Install Python 3.10+ from https://python.org/downloads"
-    echo ""
+# codegraff ships native wheels for macOS arm64 / CPython 3.12, 3.13, 3.14t only.
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "ERROR: setup.command is for macOS. On Linux/Windows, install codegraff per its docs, then run: python register_mcp.py && uvicorn server:app."
     read -p "Press Enter to close..." dummy
     exit 1
 fi
 
-# Check version >= 3.10
-PYVER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-PYMAJOR=${PYVER%.*}
-PYMINOR=${PYVER#*.}
-if [ "$PYMAJOR" -lt 3 ] || { [ "$PYMAJOR" -eq 3 ] && [ "$PYMINOR" -lt 10 ]; }; then
-    echo ""
-    echo "ERROR: Python $PYVER is too old. Need 3.10+."
-    echo "Install a newer Python from https://python.org/downloads"
-    echo ""
+# Find a compatible interpreter (3.13 preferred, then 3.12).
+PY=""
+for c in python3.13 python3.12 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12; do
+    if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+if [ -z "$PY" ]; then
+    echo "ERROR: need Python 3.12 or 3.13 (codegraff has no 3.14 wheel)."
+    echo "Install one with:  brew install python@3.13"
     read -p "Press Enter to close..." dummy
     exit 1
 fi
-echo "Found Python $PYVER"
+echo "Using $PY ($($PY -V 2>&1))"
 
-# Create venv if missing
-if [ ! -f ".venv/bin/activate" ]; then
-    echo "Creating virtualenv at .venv ..."
-    python3 -m venv .venv
+if [ ! -f ".venv-cg/bin/activate" ]; then
+    echo "Creating virtualenv at .venv-cg ..."
+    "$PY" -m venv .venv-cg
 else
-    echo "Virtualenv .venv already exists, reusing."
+    echo "Virtualenv .venv-cg already exists, reusing."
 fi
-
-source .venv/bin/activate
+source .venv-cg/bin/activate
 
 echo "Upgrading pip ..."
 python -m pip install --upgrade pip
 
-echo "Installing requirements ..."
+echo "Installing requirements (codegraff, mcp, kuri client deps) ..."
 pip install -r requirements.txt
 
-echo "Installing playwright chromium ..."
-playwright install chromium || echo "WARNING: playwright install chromium failed. You may need to run it manually later."
+echo "Installing playwright chromium (for share-card PNGs) ..."
+playwright install chromium || echo "WARNING: playwright install chromium failed; card PNGs won't render."
 
-# Prompt for OPENROUTER_API_KEY if .env missing
+echo "Registering the kuri MCP server in forge ..."
+python register_mcp.py
+
+# Prompt for CODEGRAFF_API_KEY if .env missing
 if [ ! -f ".env" ]; then
     echo ""
-    echo "No .env file found. Please paste your OpenRouter API key."
-    echo "(Grab one at https://openrouter.ai — single key, routes to MiMo-V2.5 for nav + vision.)"
+    echo "No .env file found. Please paste your codegraff API key."
+    echo "(Grab one at https://codegraff.com/dashboard/keys — a cg_sk_ key.)"
     echo "It will be saved to .env in this folder."
-    read -p "OPENROUTER_API_KEY: " APIKEY
+    read -p "CODEGRAFF_API_KEY: " APIKEY
     if [ -z "$APIKEY" ]; then
         echo "No key entered, skipping .env creation. You can create it later from .env.example."
     else
-        echo "OPENROUTER_API_KEY=$APIKEY" > .env
+        echo "CODEGRAFF_API_KEY=$APIKEY" > .env
         echo "Wrote .env"
     fi
 else
@@ -65,6 +62,6 @@ else
 fi
 
 echo ""
-echo "Setup complete. Double-click instaclaw.command to start."
+echo "Setup complete. Make sure kuri is running, then double-click instaclaw.command."
 echo ""
 read -p "Press Enter to close..." dummy

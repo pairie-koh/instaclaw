@@ -5,7 +5,6 @@ No persistent profile — pure rendering, unlike scrape.py.
 """
 import sys
 from pathlib import Path
-from playwright.sync_api import sync_playwright
 
 VIEWPORTS = {
     "card":   {"width": 600,  "height": 800,  "full_page": True},
@@ -18,6 +17,7 @@ def screenshot(html_path: Path, out_path: Path, mode: str = "card") -> Path:
     if mode not in VIEWPORTS:
         raise ValueError(f"unknown mode {mode!r}; expected one of {list(VIEWPORTS)}")
     cfg = VIEWPORTS[mode]
+    from playwright.sync_api import sync_playwright  # lazy: optional card-PNG dep
     url = "file:///" + str(html_path.resolve()).replace("\\", "/").lstrip("/")
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
