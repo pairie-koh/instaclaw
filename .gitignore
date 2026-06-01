@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .env
 .venv/
+.venv-cg/
+.agent-scratch/
+codedb.snapshot

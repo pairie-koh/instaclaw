@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 cd "$(dirname "$0")"
 
-if [ ! -f ".venv/bin/activate" ]; then
-    echo "ERROR: .venv not found. Run setup.command first."
+if [ ! -f ".venv-cg/bin/activate" ]; then
+    echo "ERROR: .venv-cg not found. Run setup.command first."
     read -p "Press Enter to close..." dummy
     exit 1
 fi
 
-source .venv/bin/activate
+source .venv-cg/bin/activate
 
 if [ -f ".env" ]; then
     set -a
     source .env
     set +a
 else
-    echo "WARNING: .env not found. Server will start but OpenRouter calls will fail."
+    echo "WARNING: .env not found. Server will start but codegraff calls will fail."
 fi
 
 (sleep 2 && open http://localhost:8000) &

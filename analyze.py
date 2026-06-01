@@ -3,13 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from openai import OpenAI
-
-MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
-client = OpenAI(
-    base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-)
+import cg_agent
 
 # Few-shot anchors used by both prompts to calibrate "specific" vs "generic".
 # Keep these visceral and weird — they set the ceiling.
@@ -125,47 +119,64 @@ No prose outside the JSON. No code fences."""
 
 
 def _extract_json(text: str) -> dict:
+    """Pull a JSON object out of the agent's reply. The forge agent is not a
+    JSON-mode endpoint, so the readout can arrive fence-wrapped or with stray
+    prose around it — scan for the first balanced {...} and parse that."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("no JSON object in model output")
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("unbalanced JSON object in model output")
 
 
 def aura(self_data: dict) -> dict:
-    resp = client.chat.completions.create(
-        model=MODEL,
-        max_tokens=4000,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_AURA},
-            {"role": "user",
-             "content": f"IG scrape for @{self_data['handle']}. Write the aura readout.\n\n```json\n{json.dumps(self_data, ensure_ascii=False)[:180000]}\n```"},
-        ],
+    prompt = (
+        SYSTEM_AURA
+        + f"\n\nIG scrape for @{self_data['handle']}. Write the aura readout. "
+        + "Output STRICT JSON only — no prose, no code fences.\n\n```json\n"
+        + json.dumps(self_data, ensure_ascii=False)[:180000]
+        + "\n```"
     )
-    return _extract_json(resp.choices[0].message.content or "")
+    return _extract_json(cg_agent.run(prompt))
 
 
 def vibe(self_data: dict, target_data: dict, self_aura: dict | None = None) -> dict:
     self_summary = json.dumps(self_aura, ensure_ascii=False) if self_aura else "(no prior aura — derive briefly from the self scrape data below)"
-    resp = client.chat.completions.create(
-        model=MODEL,
-        max_tokens=4000,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_VIBE},
-            {"role": "user",
-             "content": (
-                f"YOU (the user): @{self_data['handle']}\n"
-                f"Prior aura summary: {self_summary}\n\n"
-                f"YOUR FULL SCRAPE:\n```json\n{json.dumps(self_data, ensure_ascii=False)[:60000]}\n```\n\n"
-                f"TARGET: @{target_data['handle']}\n"
-                f"TARGET SCRAPE:\n```json\n{json.dumps(target_data, ensure_ascii=False)[:100000]}\n```\n\n"
-                "Write the vibe-check readout."
-             )},
-        ],
+    prompt = (
+        SYSTEM_VIBE
+        + f"\n\nYOU (the user): @{self_data['handle']}\n"
+        + f"Prior aura summary: {self_summary}\n\n"
+        + f"YOUR FULL SCRAPE:\n```json\n{json.dumps(self_data, ensure_ascii=False)[:60000]}\n```\n\n"
+        + f"TARGET: @{target_data['handle']}\n"
+        + f"TARGET SCRAPE:\n```json\n{json.dumps(target_data, ensure_ascii=False)[:100000]}\n```\n\n"
+        + "Write the vibe-check readout. Output STRICT JSON only — no prose, no code fences."
     )
-    return _extract_json(resp.choices[0].message.content or "")
+    return _extract_json(cg_agent.run(prompt))
 
 
 if __name__ == "__main__":

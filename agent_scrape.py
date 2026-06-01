@@ -1,33 +1,26 @@
-"""Kuri-driven Instagram scraper with incremental checkpointing.
+"""Kuri-driven Instagram scraper, rebuilt on the codegraff SDK.
 
-Each piece of data the agent extracts is written to disk through a dedicated
-save_* tool action, so if the loop dies (LLM timeout, context bloat, exception)
-the partial file on disk still has everything collected so far. Public surface
-(ScrapeResult, CheckpointStore, scrape_self/target/focused_scrape, PROFILE_DIR)
-is preserved so analyze.py / server.py / render.py work unchanged.
+The forge agent (codegraff Python SDK; see cg_agent.py) drives a real Chrome
+through the `kuri` MCP server (kuri_mcp.py): browser-control tools plus save_*
+checkpoint tools that flush out/{mode}_{handle}.json on every call. instaclaw
+hands the agent a scrape task with graff.chat() and reads the checkpoint file
+when the turn ends — so a dead loop still leaves everything collected so far on
+disk. The screenshot tool routes a PNG through the omnimodal model over the
+codegraff gateway and returns text (handled inside kuri_mcp.py).
 
-Engine: kuri (https://github.com/justrach/kuri) v0.4.5+ drives Chrome over CDP
-via its HTTP API. Both the nav loop and the screenshot tool's vision side call
-run on Xiaomi MiMo-V2.5 (omnimodal — text agent + vision in one model) via
-OpenRouter. The screenshot tool captures a PNG, posts it to the same model in
-a separate single-shot call, and returns the text description back to the nav
-loop as the tool_result — keeps the nav loop's context lean while still
-letting overlay text on reel video frames be read on demand.
+Public surface (ScrapeResult, CheckpointStore, scrape_self/target/
+focused_scrape, PROFILE_DIR) is preserved so analyze.py / server.py / render.py
+work unchanged.
 """
 from __future__ import annotations
 
-import asyncio
-import base64
 import json
-import os
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from kuri_client import Kuri, KuriError, KuriTab
+import cg_agent
 
 # Narrate callback signature used by the web layer: (step, thinking, next_goal).
 NarrateCb = Optional[Callable[[int, str, str], None]]
@@ -36,46 +29,6 @@ ROOT = Path(__file__).parent
 PROFILE_DIR = ROOT / ".chrome-profile"
 OUT_DIR = ROOT / "out"
 OUT_DIR.mkdir(exist_ok=True)
-MODEL = os.environ.get("INSTACLAW_MODEL", "xiaomi/mimo-v2.5")
-LLM_TIMEOUT_S = int(os.environ.get("INSTACLAW_LLM_TIMEOUT", "180"))
-MAX_TURNS = int(os.environ.get("INSTACLAW_MAX_TURNS", "60"))
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-
-
-def _client() -> OpenAI:
-    return OpenAI(base_url=OPENROUTER_BASE_URL,
-                  api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-                  timeout=LLM_TIMEOUT_S)
-
-
-def _describe_screenshot(png_bytes: bytes, current_url: str) -> str:
-    """Side call to the omnimodal model with the captured PNG. Returns a focused
-    text description so the nav loop receives a string-shaped tool_result."""
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    try:
-        resp = _client().chat.completions.create(
-            model=MODEL,
-            max_tokens=800,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": (
-                        f"This is a screenshot of {current_url}. List every piece of "
-                        "text visible in the image, with priority on: text burned into "
-                        "video frames (overlay captions, audio track names, sticker "
-                        "text), text on image posts, and any handle / caption / count "
-                        "not already in plain DOM. Transcribe verbatim where possible. "
-                        "If no extra text is present beyond standard IG chrome, say so."
-                    )},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                ],
-            }],
-        )
-        return (resp.choices[0].message.content or "").strip() or "(vision returned no description)"
-    except Exception as e:
-        return f"(vision call failed: {type(e).__name__}: {e})"
-
 
 # ---------- output schema (matches the prior browser-use version) ----------
 class Header(BaseModel):
@@ -291,256 +244,56 @@ Finish when done or by step 50. Everything is on disk via save_* calls.
 """
 
 
-# ---------- tool schema (OpenAI function-calling format) ----------
-def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
-        },
+# ---------- engine: the forge agent drives the kuri MCP server ----------
+def _kuri_preamble(stem: str) -> str:
+    return f"""You are driving a real, already-logged-in Chrome browser through the `kuri` MCP server to scrape Instagram.
+
+Use ONLY the kuri tools listed below. Do NOT use shell, file, web-search, or any
+other tools — they cannot see Instagram and will only waste turns.
+
+Browser: navigate(url), snap_interactive(), snap_text(), page_text(),
+click(ref), type_text(ref, text, submit), scroll(dy), back(), current_url(),
+screenshot(full_page).
+
+Checkpoint (call the instant you extract each item, and pass stem="{stem}" to
+EVERY one): save_header, mark_private, save_reel, save_highlight,
+save_grid_post, save_tagged, save_saved.
+
+Hard requirement: every save_* call MUST include stem="{stem}".
+"""
+
+
+def _empty_result(mode: str, handle: str) -> dict:
+    state: dict = {
+        "mode": mode, "handle": handle, "private": False,
+        "header": {"name": "", "header_text": "", "stats_raw": []},
+        "grid": [], "reels": [], "tagged": [], "highlights": [],
+        "following": [], "mutuals": [],
     }
-
-
-def _tools(mode: str) -> list[dict]:
-    save_tools: list[dict] = [
-        _fn("save_header",
-            "Save the profile header. Call once after extracting name/bio/stats.",
-            {"name": {"type": "string"},
-             "header_text": {"type": "string"},
-             "stats_raw": {"type": "array", "items": {"type": "string"}}},
-            ["name", "header_text", "stats_raw"]),
-        _fn("mark_private",
-            "Mark this target account as PRIVATE. Call only when the page shows the private wall and content is not visible.",
-            {}, []),
-        _fn("save_reel",
-            "Save one repost from the Reposts tab. URL path like /p/ABC/ or /reel/XYZ/, caption, creator (especially the ORIGINAL poster for reposts), audio track name.",
-            {"url": {"type": "string"},
-             "caption": {"type": "string"},
-             "creator": {"type": "string"},
-             "audio": {"type": "string"}},
-            ["url", "caption", "creator", "audio"]),
-        _fn("save_highlight",
-            "Save one story highlight bubble after clicking through all its slides.",
-            {"title": {"type": "string"},
-             "cover_text": {"type": "string"},
-             "slides": {"type": "array", "items": {"type": "string"}}},
-            ["title", "cover_text", "slides"]),
-        _fn("save_grid_post",
-            "Save one grid post after opening it and reading caption + top comments + likes.",
-            {"url": {"type": "string"},
-             "caption": {"type": "string"},
-             "comments": {"type": "array", "items": {"type": "string"}},
-             "likes_raw": {"type": "string"}},
-            ["url", "caption", "comments", "likes_raw"]),
-        _fn("save_tagged",
-            "Save one tagged post URL. TARGET MODE only.",
-            {"url": {"type": "string"}}, ["url"]),
-    ]
     if mode == "self":
-        save_tools.append(_fn("save_saved",
-            "Save one saved post URL. SELF MODE only.",
-            {"url": {"type": "string"}}, ["url"]))
-
-    browser_tools: list[dict] = [
-        _fn("navigate", "Navigate the current tab to a URL. Full https URLs.",
-            {"url": {"type": "string"}}, ["url"]),
-        _fn("snap_interactive",
-            "Return interactive elements on the current page as a list of {ref, role, name}. Refs (e0, e1, ...) are stable until the DOM mutates.",
-            {}, []),
-        _fn("snap_text",
-            "Return the full a11y tree as indented text. Use when you need non-interactive content like captions or comments.",
-            {}, []),
-        _fn("page_text",
-            "Return all visible text on the page. Heavier than snap_text.",
-            {}, []),
-        _fn("click", "Click an element by its ref from snap_interactive.",
-            {"ref": {"type": "string"}}, ["ref"]),
-        _fn("type", "Type text into an input element identified by ref.",
-            {"ref": {"type": "string"},
-             "text": {"type": "string"},
-             "submit": {"type": "boolean", "description": "Press Enter after typing"}},
-            ["ref", "text"]),
-        _fn("scroll", "Scroll the page by dy pixels (positive = down).",
-            {"dy": {"type": "integer"}}, ["dy"]),
-        _fn("back", "Browser back button.", {}, []),
-        _fn("current_url", "Get the current page URL.", {}, []),
-        _fn("screenshot",
-            "Capture a PNG of the current page, route it through a vision model, and return that model's text description. Use only when text tools (snap_text, page_text) aren't enough — e.g. overlay text burned into a reel video frame, audio name rendered as visual UI.",
-            {"full_page": {"type": "boolean",
-                           "description": "Capture the full scrollable page instead of just the viewport."}},
-            []),
-    ]
-    return browser_tools + save_tools
+        state["saved"] = []
+    return state
 
 
-# ---------- tool dispatch ----------
-def _execute_tool(tab: KuriTab, store: CheckpointStore, name: str, args: dict) -> str:
-    """Run a tool call. Returns a string for the tool_result content."""
+def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
+    """Hand the scrape task to the forge agent; it drives kuri and flushes
+    out/{stem}.json through the save_* tools. Read that file back when the turn
+    ends — whatever was checkpointed is the canonical result."""
+    stem = f"{mode}_{handle}"
+    out_path = OUT_DIR / f"{stem}.json"
+    prompt = _kuri_preamble(stem) + "\n" + task
     try:
-        # ---- save_* (checkpoint to disk) ----
-        if name == "save_header":
-            store.set_header(args["name"], args["header_text"], args.get("stats_raw", []))
-            return f"header saved: name={args['name']!r}"
-        if name == "mark_private":
-            store.mark_private()
-            return "marked private"
-        if name == "save_reel":
-            store.add_reel(args["url"], args["caption"], args["creator"], args["audio"])
-            return f"reel #{len(store.state['reels'])} saved: {args['url']}"
-        if name == "save_highlight":
-            store.add_highlight(args["title"], args.get("cover_text", ""), args.get("slides", []))
-            return f"highlight #{len(store.state['highlights'])} saved: {args['title']!r} ({len(args.get('slides', []))} slides)"
-        if name == "save_grid_post":
-            store.add_grid_post(args["url"], args["caption"], args.get("comments", []), args.get("likes_raw", ""))
-            return f"grid post #{len(store.state['grid'])} saved: {args['url']}"
-        if name == "save_tagged":
-            store.add_tagged(args["url"])
-            return f"tagged #{len(store.state['tagged'])} saved"
-        if name == "save_saved":
-            store.add_saved(args["url"])
-            return f"saved #{len(store.state.get('saved') or [])} saved"
-
-        # ---- browser tools (kuri) ----
-        if name == "navigate":
-            tab.goto(args["url"])
-            time.sleep(2.5)
-            return f"navigated to {tab.url()}"
-        if name == "snap_interactive":
-            nodes = tab.snap(interactive_only=True)
-            return json.dumps([{"ref": n.ref, "role": n.role, "name": n.name} for n in nodes])
-        if name == "snap_text":
-            return tab.snap_text()
-        if name == "page_text":
-            return tab.text()[:6000]
-        if name == "click":
-            tab.click(args["ref"])
-            time.sleep(1.2)
-            return "clicked"
-        if name == "type":
-            tab.type(args["ref"], args["text"], submit=args.get("submit", False))
-            time.sleep(0.6)
-            return "typed"
-        if name == "scroll":
-            tab.scroll(int(args["dy"]))
-            time.sleep(0.8)
-            return "scrolled"
-        if name == "back":
-            tab.back()
-            time.sleep(1.5)
-            return f"back -> {tab.url()}"
-        if name == "current_url":
-            return tab.url()
-        if name == "screenshot":
-            png = tab.screenshot(full_page=bool(args.get("full_page", False)))
-            current = tab.url()
-            description = _describe_screenshot(png, current)
-            return f"vision description of {current}:\n{description}"
-        return f"unknown tool: {name}"
-    except KuriError as e:
-        return f"tool error: {e}"
-    except Exception as e:
-        return f"tool error: {type(e).__name__}: {e}"
-
-
-# ---------- agent loop ----------
-def _short_args(d: dict) -> str:
-    s = json.dumps(d, ensure_ascii=False)
-    return s if len(s) < 80 else s[:77] + "..."
-
-
-def _parse_args(arg_str: str) -> dict:
-    """OpenAI-compatible APIs return tool-call arguments as a JSON string. Parse defensively."""
-    if not arg_str:
-        return {}
-    try:
-        return json.loads(arg_str)
-    except json.JSONDecodeError:
-        return {}
-
-
-async def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
-    out_path = OUT_DIR / f"{mode}_{handle}.json"
-    store = CheckpointStore(out_path, mode, handle)
-
-    k = Kuri()
-    try:
-        tab = k.first_tab()
-    except KuriError as e:
-        raise KuriError(f"kuri not reachable (start it first): {e}") from e
-
-    tools = _tools(mode)
-    client = _client()
-
-    messages: list[dict] = [
-        {"role": "system", "content": task},
-        {"role": "user", "content": "Begin. Use the tools to complete the task above."},
-    ]
-
-    for step in range(1, MAX_TURNS + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                max_tokens=4096,
-                tools=tools,
-                messages=messages,
-            )
-        except Exception as e:
-            print(f">>> [{step}] LLM call failed: {type(e).__name__}: {e}")
-            break
-
-        msg = resp.choices[0].message
-        thinking = (msg.content or "").strip()
-        tool_calls = msg.tool_calls or []
-        next_goal = ", ".join(
-            f"{tc.function.name}({_short_args(_parse_args(tc.function.arguments))})"
-            for tc in tool_calls
-        ) if tool_calls else ""
-
-        if thinking or next_goal:
-            print(f">>> [{step}] {thinking}".rstrip())
-            if next_goal:
-                print(f">>> [{step}] next: {next_goal}")
-            if narrate is not None:
-                try:
-                    narrate(step, thinking, next_goal)
-                except Exception as e:
-                    print(f">>> [narrate-cb error] {e}")
-
-        # Append the assistant turn verbatim so the model sees its own tool_calls
-        # on the next round.
-        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        if tool_calls:
-            assistant_msg["tool_calls"] = [
-                {"id": tc.id, "type": "function",
-                 "function": {"name": tc.function.name,
-                              "arguments": tc.function.arguments or "{}"}}
-                for tc in tool_calls
-            ]
-        messages.append(assistant_msg)
-
-        # No tool calls = agent decided it's done.
-        if not tool_calls:
-            break
-
-        for tc in tool_calls:
-            args = _parse_args(tc.function.arguments)
-            out = _execute_tool(tab, store, tc.function.name, args)
-            if len(out) > 8000:
-                out = out[:8000] + "\n... [truncated]"
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
-
-    # Whatever happened, the checkpoint file on disk is the canonical result.
-    return json.loads(out_path.read_text(encoding="utf-8"))
+        cg_agent.run(prompt, narrate=narrate)
+    except Exception as e:  # noqa
+        print(f">>> agent run failed: {type(e).__name__}: {e}")
+    if out_path.exists():
+        return json.loads(out_path.read_text(encoding="utf-8"))
+    return _empty_result(mode, handle)
 
 
 def _write(data: dict, mode: str, handle: str) -> dict:
-    # CheckpointStore already wrote the file; this is just for the log line.
+    # The kuri save_* tools already wrote the file; this is the log line + a
+    # fallback flush if the agent saved nothing.
     out_path = OUT_DIR / f"{mode}_{handle}.json"
     if not out_path.exists():
         out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -550,110 +303,41 @@ def _write(data: dict, mode: str, handle: str) -> dict:
 
 def scrape_self(handle: str, narrate: NarrateCb = None) -> dict:
     print(f">>> starting self-scrape for @{handle}")
-    data = asyncio.run(_run(_self_task(handle), "self", handle, narrate=narrate))
+    data = _run(_self_task(handle), "self", handle, narrate=narrate)
     return _write(data, "self", handle)
 
 
 def scrape_target(handle: str, narrate: NarrateCb = None) -> dict:
     print(f">>> starting target-scrape for @{handle}")
-    data = asyncio.run(_run(_target_task(handle), "target", handle, narrate=narrate))
+    data = _run(_target_task(handle), "target", handle, narrate=narrate)
     return _write(data, "target", handle)
 
 
 # ---------- focused investigation used by the chat layer ----------
 async def focused_scrape(query: str, base_handle: str, narrate: NarrateCb = None) -> str:
-    """Open a kuri-driven MiMo loop for a follow-up question. Returns prose evidence."""
-    task = f"""You are investigating Instagram for a follow-up question about @{base_handle}.
+    """Run a kuri-driven forge loop for a follow-up question. Returns prose evidence.
+
+    No save_* here — the agent's final text response IS the answer.
+    """
+    import asyncio
+    task = _kuri_preamble(f"focused_{base_handle}") + "\n" + f"""You are investigating Instagram for a follow-up question about @{base_handle}.
 
 QUESTION: {query}
 
 Start at https://www.instagram.com/{base_handle}/. You may navigate to other
 profiles they interact with (frequent commenters, tagged accounts, people they
-repost). Read posts, captions, comments, and reels as needed.
+repost). Read posts, captions, comments, and reels as needed. You do NOT need to
+save anything.
 
 {GLOBAL_RULES}
 
-When you have an answer, STOP calling tools — your final text response IS the
-answer. Cite specific posts (URL path), commenters (@handle), reels, captions,
-or audio tracks you saw. If you couldn't find an answer, say so plainly and
-describe what you did look at. Keep it under ~400 words. No speculation beyond
-what's visible.
+When you have an answer, STOP. Your final text response IS the answer. Cite
+specific posts (URL path), commenters (@handle), reels, captions, or audio
+tracks you saw. If you couldn't find an answer, say so plainly and describe what
+you looked at. Keep it under ~400 words. No speculation beyond what's visible.
 """
-
-    k = Kuri()
-    tab = k.first_tab()
-    # Reuse the browser tool list (no save_* — this returns prose).
-    tools = [
-        t for t in _tools("target")
-        if not t["function"]["name"].startswith("save_")
-        and t["function"]["name"] != "mark_private"
-    ]
-    client = _client()
-
-    # Throwaway store so _execute_tool's signature works; we never call save_*.
-    store = CheckpointStore(OUT_DIR / f"_focused_{base_handle}.tmp.json", "target", base_handle)
-
-    messages: list[dict] = [
-        {"role": "system", "content": task},
-        {"role": "user", "content": "Begin investigating to answer the question above."},
-    ]
-
-    final_text = ""
-    for step in range(1, MAX_TURNS + 1):
-        try:
-            resp = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=MODEL, max_tokens=4096, tools=tools, messages=messages,
-            )
-        except Exception as e:
-            print(f">>> [focused {step}] LLM failed: {type(e).__name__}: {e}")
-            break
-
-        msg = resp.choices[0].message
-        text = (msg.content or "").strip()
-        tool_calls = msg.tool_calls or []
-        next_goal = ", ".join(
-            f"{tc.function.name}({_short_args(_parse_args(tc.function.arguments))})"
-            for tc in tool_calls
-        ) if tool_calls else ""
-
-        if text or next_goal:
-            print(f">>> [focused {step}] {text}".rstrip())
-            if next_goal:
-                print(f">>> [focused {step}] next: {next_goal}")
-            if narrate is not None:
-                try:
-                    narrate(step, text, next_goal)
-                except Exception:
-                    pass
-
-        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        if tool_calls:
-            assistant_msg["tool_calls"] = [
-                {"id": tc.id, "type": "function",
-                 "function": {"name": tc.function.name,
-                              "arguments": tc.function.arguments or "{}"}}
-                for tc in tool_calls
-            ]
-        messages.append(assistant_msg)
-
-        if not tool_calls:
-            final_text = text
-            break
-
-        for tc in tool_calls:
-            args = _parse_args(tc.function.arguments)
-            out = _execute_tool(tab, store, tc.function.name, args)
-            if len(out) > 8000:
-                out = out[:8000] + "\n... [truncated]"
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
-
-    try:
-        (OUT_DIR / f"_focused_{base_handle}.tmp.json").unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    return final_text.strip() or "(no evidence found)"
+    text = await asyncio.to_thread(cg_agent.run, task, narrate)
+    return (text or "").strip() or "(no evidence found)"
 
 
 if __name__ == "__main__":
