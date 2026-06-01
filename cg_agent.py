@@ -23,6 +23,14 @@ SCRATCH.mkdir(exist_ok=True)
 MODEL = os.environ.get("INSTACLAW_MODEL", "mimo-v2.5")
 MAX_TOKENS = int(os.environ.get("INSTACLAW_MAX_TOKENS", "24000"))
 
+# Agent selection (codegraff>=0.1.3). DEFAULT_AGENT is the full-tool built-in
+# forge agent — the historical default every turn already ran as. SCRAPER_AGENT
+# is the kuri-scoped custom agent (.forge/agents/kuri-scraper.md) used for
+# scrapes so the nav loop is confined to the browser and can't wander into
+# shell/file/web tools.
+DEFAULT_AGENT = "forge"
+SCRAPER_AGENT = "kuri-scraper"
+
 NarrateCb = Optional[Callable[[int, str, str], None]]
 
 _graff = None
@@ -44,7 +52,9 @@ def _agent():
     global _graff
     if _graff is None:
         from codegraff import Graff
+        import register_mcp
         _load_env()
+        register_mcp.ensure_kuri_agent()  # idempotent: sync the agent into forge's global agents dir
         key = os.environ.get("CODEGRAFF_API_KEY") or os.environ.get("CG_API_KEY", "")
         kwargs = dict(cwd=str(SCRATCH), provider="codegraff", model=MODEL, max_tokens=MAX_TOKENS)
         if key:
@@ -70,7 +80,8 @@ def _short(args) -> str:
     return s[:120] + ("…" if len(s) > 120 else "")
 
 
-def run(prompt: str, narrate: NarrateCb = None, model: Optional[str] = None) -> str:
+def run(prompt: str, narrate: NarrateCb = None, model: Optional[str] = None,
+        agent_id: Optional[str] = None) -> str:
     """Run one agent turn to completion (blocking; releases the GIL while waiting).
 
     Streams reasoning + tool calls to `narrate(step, thinking, next_goal)` and
@@ -78,11 +89,15 @@ def run(prompt: str, narrate: NarrateCb = None, model: Optional[str] = None) -> 
     the return is ignored — the data is whatever the kuri save_* tools flushed to
     disk; for analyze/chat it's the readout / reply text.
     """
-    agent = _agent()
+    graff = _agent()
     step = 0
     last_reasoning = ""
     chunks: list[str] = []
-    for ev in agent.chat(prompt, model=model or MODEL):
+    # codegraff>=0.1.3 per-call agent selection is sticky across chats on the
+    # long-lived Graff, so always pass an explicit agent: the kuri-scoped
+    # scraper for scrapes, else reset to the full-tool "forge" default so a
+    # prior scrape's tool scope can't leak into a later analyze/chat turn.
+    for ev in graff.chat(prompt, model=model or MODEL, agent=agent_id or DEFAULT_AGENT):
         t = ev.type
         if t == "TaskReasoning":
             last_reasoning = _text_of(ev.data.get("content")) or last_reasoning

@@ -283,7 +283,7 @@ def _run(task: str, mode: str, handle: str, narrate: NarrateCb = None) -> dict:
     out_path = OUT_DIR / f"{stem}.json"
     prompt = _kuri_preamble(stem) + "\n" + task
     try:
-        cg_agent.run(prompt, narrate=narrate)
+        cg_agent.run(prompt, narrate=narrate, agent_id=cg_agent.SCRAPER_AGENT)
     except Exception as e:  # noqa
         print(f">>> agent run failed: {type(e).__name__}: {e}")
     if out_path.exists():
@@ -336,7 +336,7 @@ specific posts (URL path), commenters (@handle), reels, captions, or audio
 tracks you saw. If you couldn't find an answer, say so plainly and describe what
 you looked at. Keep it under ~400 words. No speculation beyond what's visible.
 """
-    text = await asyncio.to_thread(cg_agent.run, task, narrate)
+    text = await asyncio.to_thread(cg_agent.run, task, narrate, None, cg_agent.SCRAPER_AGENT)
     return (text or "").strip() or "(no evidence found)"
 
 

@@ -4,6 +4,32 @@ Things deferred so the demo could ship. Each section has a short rationale and a
 "how to enable" note since the scaffolding is usually already in `agent_scrape.py`
 — the prompt instructions are what's missing.
 
+## Deterministic scrapes via a tool-scoped agent (status: DONE, this branch)
+
+Scrapes now run as a dedicated forge custom agent, `kuri-scraper`
+(`.forge/agents/kuri-scraper.md`), whose `tools:` allowlist is scoped to
+`mcp_kuri_tool_*` — ONLY the kuri MCP browser + checkpoint tools. The default
+`forge` agent ships the full tool belt (read/write/shell/fetch/task + all MCP
+servers), which let the nav loop wander off-surface (shelling out, web-search)
+instead of driving the browser; scoping removes those tools entirely, so the
+loop is structurally confined to kuri.
+
+Enabled by **codegraff>=0.1.3**, the first SDK release to expose per-call agent
+selection — `graff.chat(prompt, agent="kuri-scraper")` (also `set_active_agent`
+/ `get_active_agent`). That's exactly the ask filed in justrach/codegraff#153
+and tracked in instaclaw#3. The agent `.md` is version-controlled in the repo
+and installed into forge's user-level agents dir (`~/.forge/agents/`) by
+`register_mcp.py` — same reason kuri's MCP server is registered user-level:
+project-local forge configs hit the headless trust gate (codegraff#152), while
+the global agents dir is loaded regardless of cwd and has no trust gate.
+
+`cg_agent.run()` gained an `agent_id` arg: `agent_scrape` (scrape + focused
+follow-ups) passes `kuri-scraper`; `analyze`/`chat` reset to `forge`. The reset
+is load-bearing — per-call selection is *sticky* across chats on the one
+long-lived `Graff`, so a leaked kuri-only scope would strip the read tools that
+analyze/chat depend on. (`forge` is also the historical default — every turn
+already ran as it — so non-scrape behavior is unchanged.)
+
 ## Mutuals scrape on target profiles
 
 Capture the "Followed by @X, @Y, and N others you follow" section that IG renders
